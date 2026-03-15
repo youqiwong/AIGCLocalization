@@ -96,6 +96,43 @@ def run_eval(model: torch.nn.Module, loader: DataLoader, accelerator: Accelerato
     return m
 
 
+def run_validation(
+    *,
+    epoch: int,
+    step: int,
+    model: torch.nn.Module,
+    opt: torch.optim.Optimizer,
+    val_loader: DataLoader,
+    accelerator: Accelerator,
+    use_wandb: bool,
+    out_dir: Path,
+    best_iou: float,
+    best_step: int,
+):
+    accelerator.wait_for_everyone()
+    val_metrics = run_eval(model, val_loader, accelerator=accelerator)
+    accelerator.print(json.dumps({"epoch": epoch, "step": step, "val": val_metrics}, ensure_ascii=False))
+    if use_wandb:
+        accelerator.log({f"val/{k}": float(v) for k, v in val_metrics.items()}, step=step)
+    if val_metrics["iou"] > best_iou:
+        best_iou = val_metrics["iou"]
+        best_step = step
+        if accelerator.is_main_process:
+            save_checkpoint(
+                str(out_dir / "best_by_iou.pt"),
+                {
+                    "model": accelerator.unwrap_model(model).state_dict(),
+                    "optimizer": opt.state_dict(),
+                    "epoch": epoch,
+                    "step": step,
+                    "best_iou": best_iou,
+                    "best_step": best_step,
+                },
+            )
+    model.train()
+    return best_iou, best_step
+
+
 def make_timestamped_output_dir(base_output_dir: str, accelerator: Accelerator, resume: str = "") -> Path:
     if resume:
         return Path(resume).resolve().parent
@@ -173,6 +210,8 @@ def main() -> None:
     step = 0
     best_iou = -1.0
     best_step = -1
+    val_every_steps = int(train_cfg.get("val_every_steps", 0))
+    val_every_epoch = int(train_cfg.get("val_every_epoch", 0))
     resume = train_cfg.get("resume", "")
     if resume:
         ckpt = load_checkpoint(resume, map_location="cpu")
@@ -194,6 +233,7 @@ def main() -> None:
 
     for epoch in range(start_epoch, int(train_cfg["epochs"])):
         model.train()
+        last_eval_step = -1
         opt.zero_grad(set_to_none=True)
         pbar = tqdm(
             total=len(train_loader),
@@ -265,7 +305,7 @@ def main() -> None:
 
             vis_every = int(train_cfg.get("vis_every", 0))
             if vis_every > 0 and step % vis_every == 0 and accelerator.is_main_process:
-                nvis = min(2, image.shape[0])
+                nvis = min(5, image.shape[0])
                 save_triplet_vis(
                     image=image[:nvis].detach().float().cpu(),
                     gt_mask=gt_mask[:nvis].detach().float().cpu(),
@@ -274,26 +314,36 @@ def main() -> None:
                     path=str(out_dir / "vis" / f"train_step{step}.png"),
                 )
 
-        accelerator.wait_for_everyone()
-        val_metrics = run_eval(model, val_loader, accelerator=accelerator)
-        accelerator.print(json.dumps({"epoch": epoch, "step": step, "val": val_metrics}, ensure_ascii=False))
-        if use_wandb:
-            accelerator.log({f"val/{k}": float(v) for k, v in val_metrics.items()}, step=step)
-        if val_metrics["iou"] > best_iou:
-            best_iou = val_metrics["iou"]
-            best_step = step
-            if accelerator.is_main_process:
-                save_checkpoint(
-                    str(out_dir / "best_by_iou.pt"),
-                    {
-                        "model": accelerator.unwrap_model(model).state_dict(),
-                        "optimizer": opt.state_dict(),
-                        "epoch": epoch,
-                        "step": step,
-                        "best_iou": best_iou,
-                        "best_step": best_step,
-                    },
+            if val_every_epoch == 0 and val_every_steps > 0 and step % val_every_steps == 0:
+                best_iou, best_step = run_validation(
+                    epoch=epoch,
+                    step=step,
+                    model=model,
+                    opt=opt,
+                    val_loader=val_loader,
+                    accelerator=accelerator,
+                    use_wandb=use_wandb,
+                    out_dir=out_dir,
+                    best_iou=best_iou,
+                    best_step=best_step,
                 )
+                last_eval_step = step
+
+        should_run_epoch_val = val_every_epoch > 0 and (epoch + 1) % val_every_epoch == 0
+        should_run_step_fallback = val_every_epoch == 0 and (val_every_steps <= 0 or last_eval_step != step)
+        if should_run_epoch_val or should_run_step_fallback:
+            best_iou, best_step = run_validation(
+                epoch=epoch,
+                step=step,
+                model=model,
+                opt=opt,
+                val_loader=val_loader,
+                accelerator=accelerator,
+                use_wandb=use_wandb,
+                out_dir=out_dir,
+                best_iou=best_iou,
+                best_step=best_step,
+            )
         pbar.close()
         if accelerator.is_main_process:
             save_checkpoint(

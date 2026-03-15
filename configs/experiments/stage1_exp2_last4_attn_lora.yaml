@@ -9,8 +9,8 @@ data:
     val: artifacts/manifests/debug_val.jsonl
     test: artifacts/manifests/debug_test.jsonl
   image_size: 512
-  num_workers: 2
-  batch_size: 4
+  num_workers: 8
+  batch_size: 16
   prefetch_factor: 1
   persistent_workers: false
 
@@ -38,12 +38,13 @@ model:
     edge_head: false
 
 train:
-  epochs: 5
+  epochs: 50
   lr: 0.0001
   weight_decay: 0.01
   log_every: 10
   print_train_log: false
   vis_every: 50
+  val_every_epoch: 1
   mixed_precision: bf16
   gradient_accumulation_steps: 4
   find_unused_parameters: true

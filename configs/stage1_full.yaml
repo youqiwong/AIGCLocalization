@@ -10,7 +10,7 @@ data:
     test: artifacts/manifests/full_test.jsonl
   image_size: 448
   num_workers: 8
-  batch_size: 8
+  batch_size: 16
 
 model:
   backbone:
@@ -36,11 +36,12 @@ model:
     edge_head: false
 
 train:
-  epochs: 20
+  epochs: 50
   lr: 0.00005
   weight_decay: 0.01
   log_every: 20
   vis_every: 500
+  val_every_epoch: 1
   val_every_steps: 500
   amp: true
   resume: ""

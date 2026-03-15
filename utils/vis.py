@@ -5,13 +5,31 @@ import torch
 from torchvision.utils import save_image
 
 
+def _heatmap_to_rgb(heatmap: torch.Tensor) -> torch.Tensor:
+    heatmap = heatmap.clamp(0.0, 1.0)
+    low = heatmap <= 0.5
+    high = ~low
+    rgb = torch.empty((3, *heatmap.shape[-2:]), dtype=heatmap.dtype, device=heatmap.device)
+    low_t = heatmap[low] / 0.5
+    high_t = (heatmap[high] - 0.5) / 0.5
+
+    rgb[0][low] = low_t
+    rgb[1][low] = low_t
+    rgb[2][low] = 1.0
+
+    rgb[0][high] = 1.0
+    rgb[1][high] = 1.0 - high_t
+    rgb[2][high] = 1.0 - high_t
+    return rgb
+
+
 def save_triplet_vis(
     image: torch.Tensor,
     gt_mask: torch.Tensor,
     heatmap: torch.Tensor,
     pred_mask: torch.Tensor,
     path: str,
-    max_items: int = 4,
+    max_items: int = 5,
 ) -> None:
     # image: [B,3,H,W], others: [B,1,H,W] (heatmap may be lower-res)
     b = min(max_items, image.shape[0])
@@ -22,7 +40,7 @@ def save_triplet_vis(
     pred_mask = (pred_mask > 0.5).float()
     tiles = []
     for i in range(b):
-        h3 = heatmap[i].repeat(3, 1, 1)
+        h3 = _heatmap_to_rgb(heatmap[i])
         g3 = gt_mask[i].repeat(3, 1, 1)
         p3 = pred_mask[i].repeat(3, 1, 1)
         tiles.extend([image[i], g3, h3, p3])
