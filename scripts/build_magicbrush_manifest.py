@@ -52,7 +52,7 @@ def _ensure_list(v: Any) -> List[Any]:
 
 
 def _extract_row_id(row: Dict[str, Any], row_idx: int, split: str) -> str:
-    for key in ["id", "sample_id", "image_id", "uid", "key"]:
+    for key in ["id", "sample_id", "image_id", "img_id", "uid", "key"]:
         if key in row and row[key] is not None:
             return f"{split}-{row[key]}"
     return f"{split}-row{row_idx}"
@@ -126,6 +126,74 @@ def _build_records_from_file(path: Path, split: str) -> List[Dict[str, Any]]:
     schema_cols = [f.name for f in pf.schema_arrow]
     fields = _infer_fields(schema_cols)
     records: List[Dict[str, Any]] = []
+
+    # Explicit support for MagicBrush turn-table schema:
+    # img_id, turn_index, source_img, target_img, mask_img
+    has_turn_table = {"img_id", "turn_index", "source_img", "target_img", "mask_img"}.issubset(set(schema_cols))
+
+    if has_turn_table:
+        groups: Dict[str, Dict[str, Any]] = {}
+        for rg in range(pf.num_row_groups):
+            table = pf.read_row_group(rg, use_threads=True)
+            rows = table.to_pylist()
+            for row in rows:
+                img_id = str(row["img_id"])
+                source_group_id = f"{split}-{img_id}"
+                turn_index = int(row["turn_index"])
+                src = row.get("source_img")
+                tgt = row.get("target_img")
+                msk = row.get("mask_img")
+                if tgt is None:
+                    raise ValueError(f"target_img missing for {source_group_id} turn={turn_index}")
+                if msk is None:
+                    raise ValueError(f"mask_img missing for {source_group_id} turn={turn_index}")
+
+                if img_id not in groups:
+                    groups[img_id] = {
+                        "source_group_id": source_group_id,
+                        "clean_source": src,
+                        "clean_turn": turn_index,
+                        "turns": [],
+                    }
+                else:
+                    # Prefer source image from earliest turn as the clean input image.
+                    if turn_index < groups[img_id]["clean_turn"]:
+                        groups[img_id]["clean_source"] = src
+                        groups[img_id]["clean_turn"] = turn_index
+
+                groups[img_id]["turns"].append((turn_index, tgt, msk))
+
+        for g in groups.values():
+            clean_source = g["clean_source"]
+            if clean_source is None:
+                raise ValueError(f"source_img missing for {g['source_group_id']}")
+            records.append(
+                {
+                    "sample_id": f"{g['source_group_id']}-clean",
+                    "image": _to_jsonable(clean_source),
+                    "mask": "__ZERO__",
+                    "label": 0,
+                    "turn_index": 0,
+                    "source_group_id": g["source_group_id"],
+                    "dataset": "MagicBrush",
+                    "split": split,
+                }
+            )
+            for turn_index, tgt, msk in sorted(g["turns"], key=lambda x: x[0]):
+                sid = f"{g['source_group_id']}-turn{turn_index}"
+                records.append(
+                    {
+                        "sample_id": sid,
+                        "image": _to_jsonable(tgt),
+                        "mask": _to_jsonable(msk),
+                        "label": 1,
+                        "turn_index": int(turn_index),
+                        "source_group_id": g["source_group_id"],
+                        "dataset": "MagicBrush",
+                        "split": split,
+                    }
+                )
+        return records
 
     global_row_idx = 0
     for rg in range(pf.num_row_groups):
