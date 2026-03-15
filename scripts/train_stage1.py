@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from datasets.magicbrush_dataset import MagicBrushDataset
+from aigc_datasets.magicbrush_dataset import MagicBrushDataset
 from losses import bce_dice_loss, detection_bce_loss, focal_heatmap_loss
 from models.stage1_model import Stage1ForgeryModel
 from utils.checkpoint import load_checkpoint, save_checkpoint

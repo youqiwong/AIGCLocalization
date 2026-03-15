@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from datasets.magicbrush_dataset import MagicBrushDataset
+from aigc_datasets.magicbrush_dataset import MagicBrushDataset
 from models.stage1_model import Stage1ForgeryModel
 from utils.checkpoint import load_checkpoint
 from utils.metrics import binary_auc_ap, cls_metrics, pixel_metrics
