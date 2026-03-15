@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -100,10 +101,12 @@ def main() -> None:
 
     train_cfg = cfg["train"]
     use_wandb = bool(train_cfg.get("use_wandb", True))
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=bool(train_cfg.get("find_unused_parameters", True)))
     accelerator = Accelerator(
         mixed_precision=train_cfg.get("mixed_precision", "bf16"),
         gradient_accumulation_steps=int(train_cfg.get("gradient_accumulation_steps", 1)),
         log_with=("wandb" if use_wandb else None),
+        kwargs_handlers=[ddp_kwargs],
     )
     accelerator.print(
         f"[Accelerate] num_processes={accelerator.num_processes} "
