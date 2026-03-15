@@ -8,9 +8,11 @@ data:
     train: artifacts/manifests/debug_train.jsonl
     val: artifacts/manifests/debug_val.jsonl
     test: artifacts/manifests/debug_test.jsonl
-  image_size: 384
+  image_size: 768
   num_workers: 8
-  batch_size: 16
+  batch_size: 4
+  prefetch_factor: 1
+  persistent_workers: true
 
 model:
   backbone:
@@ -39,8 +41,9 @@ train:
   epochs: 5
   lr: 0.0001
   weight_decay: 0.01
-  log_every: 20
-  vis_every: 200
+  log_every: 1
+  print_train_log: false
+  vis_every: 1
   val_every_steps: 500
   mixed_precision: bf16
   gradient_accumulation_steps: 1

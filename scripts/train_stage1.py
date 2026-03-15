@@ -40,27 +40,33 @@ def build_loader(
     num_workers: int,
     shuffle: bool,
     processor_name_or_path: str,
+    prefetch_factor: int = 1,
+    persistent_workers: bool = True,
 ) -> DataLoader:
     ds = MagicBrushDataset(
         manifest_path=manifest,
         image_size=image_size,
         processor_name_or_path=processor_name_or_path,
     )
-    return DataLoader(
-        ds,
+    loader_kwargs = dict(
+        dataset=ds,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_magicbrush_batch,
     )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["persistent_workers"] = persistent_workers
+    return DataLoader(**loader_kwargs)
 
 
 def run_eval(model: torch.nn.Module, loader: DataLoader, accelerator: Accelerator) -> Dict[str, float]:
     model.eval()
     all_prob, all_label, all_pred_mask, all_gt_mask = [], [], [], []
     with torch.no_grad():
-        vbar = tqdm(loader, desc="Val", leave=False, disable=not accelerator.is_local_main_process)
+        vbar = tqdm(loader, desc="Val", leave=False, disable=not accelerator.is_local_main_process, dynamic_ncols=True, mininterval=0.0)
         for batch in vbar:
             image = batch["image"]
             pixel_values = batch["pixel_values"]
@@ -120,6 +126,8 @@ def main() -> None:
         num_workers=cfg["data"]["num_workers"],
         shuffle=True,
         processor_name_or_path=cfg["model"]["backbone"]["name_or_path"],
+        prefetch_factor=int(cfg["data"].get("prefetch_factor", 1)),
+        persistent_workers=bool(cfg["data"].get("persistent_workers", True)),
     )
     val_loader = build_loader(
         manifest=cfg["data"]["manifests"]["val"],
@@ -128,6 +136,8 @@ def main() -> None:
         num_workers=cfg["data"]["num_workers"],
         shuffle=False,
         processor_name_or_path=cfg["model"]["backbone"]["name_or_path"],
+        prefetch_factor=int(cfg["data"].get("prefetch_factor", 1)),
+        persistent_workers=bool(cfg["data"].get("persistent_workers", True)),
     )
 
     model = Stage1ForgeryModel(cfg["model"])
@@ -165,7 +175,14 @@ def main() -> None:
     for epoch in range(start_epoch, int(train_cfg["epochs"])):
         model.train()
         last_eval_step = -1
-        pbar = tqdm(train_loader, desc=f"Train Epoch {epoch}", leave=True, disable=not accelerator.is_local_main_process)
+        pbar = tqdm(
+            train_loader,
+            desc=f"Train Epoch {epoch}",
+            leave=True,
+            disable=not accelerator.is_local_main_process,
+            dynamic_ncols=True,
+            mininterval=0.0,
+        )
         for batch in pbar:
             with accelerator.accumulate(model):
                 image = batch["image"]
@@ -193,21 +210,23 @@ def main() -> None:
                 heat=f"{float(l_heat.item()):.4f}",
                 mask=f"{float(l_mask.item()):.4f}",
                 step=step,
+                refresh=True,
             )
 
             if step % int(train_cfg["log_every"]) == 0:
-                accelerator.print(
-                    json.dumps(
-                        {
-                            "epoch": epoch,
-                            "step": step,
-                            "loss": float(loss.item()),
-                            "l_det": float(l_det.item()),
-                            "l_heat": float(l_heat.item()),
-                            "l_mask": float(l_mask.item()),
-                        }
+                if bool(train_cfg.get("print_train_log", False)):
+                    accelerator.print(
+                        json.dumps(
+                            {
+                                "epoch": epoch,
+                                "step": step,
+                                "loss": float(loss.item()),
+                                "l_det": float(l_det.item()),
+                                "l_heat": float(l_heat.item()),
+                                "l_mask": float(l_mask.item()),
+                            }
+                        )
                     )
-                )
                 if use_wandb:
                     accelerator.log(
                         {

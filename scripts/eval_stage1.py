@@ -34,14 +34,18 @@ def main() -> None:
         image_size=cfg["data"]["image_size"],
         processor_name_or_path=cfg["model"]["backbone"]["name_or_path"],
     )
-    loader = DataLoader(
-        ds,
+    loader_kwargs = dict(
+        dataset=ds,
         batch_size=cfg["data"]["batch_size"],
         shuffle=False,
         num_workers=cfg["data"]["num_workers"],
         pin_memory=True,
         collate_fn=collate_magicbrush_batch,
     )
+    if int(cfg["data"]["num_workers"]) > 0:
+        loader_kwargs["prefetch_factor"] = int(cfg["data"].get("prefetch_factor", 1))
+        loader_kwargs["persistent_workers"] = bool(cfg["data"].get("persistent_workers", True))
+    loader = DataLoader(**loader_kwargs)
 
     model = Stage1ForgeryModel(cfg["model"]).to(device)
     ckpt = load_checkpoint(ckpt_path, map_location="cpu")
