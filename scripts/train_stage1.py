@@ -152,7 +152,6 @@ def main() -> None:
     step = 0
     best_iou = -1.0
     best_step = -1
-    val_every_steps = int(train_cfg.get("val_every_steps", 500))
     resume = train_cfg.get("resume", "")
     if resume:
         ckpt = load_checkpoint(resume, map_location="cpu")
@@ -174,7 +173,6 @@ def main() -> None:
 
     for epoch in range(start_epoch, int(train_cfg["epochs"])):
         model.train()
-        last_eval_step = -1
         opt.zero_grad(set_to_none=True)
         pbar = tqdm(
             total=len(train_loader),
@@ -255,63 +253,26 @@ def main() -> None:
                     path=str(out_dir / "vis" / f"train_step{step}.png"),
                 )
 
-            if step % val_every_steps == 0:
-                accelerator.wait_for_everyone()
-                val_metrics = run_eval(model, val_loader, accelerator=accelerator)
-                accelerator.print(json.dumps({"epoch": epoch, "step": step, "val": val_metrics}, ensure_ascii=False))
-                if use_wandb:
-                    accelerator.log({f"val/{k}": float(v) for k, v in val_metrics.items()}, step=step)
-                if accelerator.is_main_process:
-                    save_checkpoint(
-                        str(out_dir / "last.pt"),
-                        {
-                            "model": accelerator.unwrap_model(model).state_dict(),
-                            "optimizer": opt.state_dict(),
-                            "epoch": epoch,
-                            "step": step,
-                            "best_iou": best_iou,
-                            "best_step": best_step,
-                        },
-                    )
-                if val_metrics["iou"] > best_iou:
-                    best_iou = val_metrics["iou"]
-                    best_step = step
-                    if accelerator.is_main_process:
-                        save_checkpoint(
-                            str(out_dir / "best_by_iou.pt"),
-                            {
-                                "model": accelerator.unwrap_model(model).state_dict(),
-                                "optimizer": opt.state_dict(),
-                                "epoch": epoch,
-                                "step": step,
-                                "best_iou": best_iou,
-                                "best_step": best_step,
-                            },
-                        )
-                model.train()
-                last_eval_step = step
-
-        if last_eval_step != step:
-            accelerator.wait_for_everyone()
-            val_metrics = run_eval(model, val_loader, accelerator=accelerator)
-            accelerator.print(json.dumps({"epoch": epoch, "step": step, "val": val_metrics}, ensure_ascii=False))
-            if use_wandb:
-                accelerator.log({f"val/{k}": float(v) for k, v in val_metrics.items()}, step=step)
-            if val_metrics["iou"] > best_iou:
-                best_iou = val_metrics["iou"]
-                best_step = step
-                if accelerator.is_main_process:
-                    save_checkpoint(
-                        str(out_dir / "best_by_iou.pt"),
-                        {
-                            "model": accelerator.unwrap_model(model).state_dict(),
-                            "optimizer": opt.state_dict(),
-                            "epoch": epoch,
-                            "step": step,
-                            "best_iou": best_iou,
-                            "best_step": best_step,
-                        },
-                    )
+        accelerator.wait_for_everyone()
+        val_metrics = run_eval(model, val_loader, accelerator=accelerator)
+        accelerator.print(json.dumps({"epoch": epoch, "step": step, "val": val_metrics}, ensure_ascii=False))
+        if use_wandb:
+            accelerator.log({f"val/{k}": float(v) for k, v in val_metrics.items()}, step=step)
+        if val_metrics["iou"] > best_iou:
+            best_iou = val_metrics["iou"]
+            best_step = step
+            if accelerator.is_main_process:
+                save_checkpoint(
+                    str(out_dir / "best_by_iou.pt"),
+                    {
+                        "model": accelerator.unwrap_model(model).state_dict(),
+                        "optimizer": opt.state_dict(),
+                        "epoch": epoch,
+                        "step": step,
+                        "best_iou": best_iou,
+                        "best_step": best_step,
+                    },
+                )
         pbar.close()
         if accelerator.is_main_process:
             save_checkpoint(

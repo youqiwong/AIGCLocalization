@@ -17,6 +17,9 @@ def save_triplet_vis(
     b = min(max_items, image.shape[0])
     if heatmap.shape[-2:] != image.shape[-2:]:
         heatmap = torch.nn.functional.interpolate(heatmap, size=image.shape[-2:], mode="bilinear", align_corners=False)
+    if pred_mask.shape[-2:] != image.shape[-2:]:
+        pred_mask = torch.nn.functional.interpolate(pred_mask, size=image.shape[-2:], mode="bilinear", align_corners=False)
+    pred_mask = (pred_mask > 0.5).float()
     tiles = []
     for i in range(b):
         h3 = heatmap[i].repeat(3, 1, 1)

@@ -9,10 +9,10 @@ data:
     val: artifacts/manifests/debug_val.jsonl
     test: artifacts/manifests/debug_test.jsonl
   image_size: 512
-  num_workers: 8
+  num_workers: 2
   batch_size: 4
   prefetch_factor: 1
-  persistent_workers: true
+  persistent_workers: false
 
 model:
   backbone:
@@ -44,7 +44,6 @@ train:
   log_every: 10
   print_train_log: false
   vis_every: 50
-  val_every_steps: 500
   mixed_precision: bf16
   gradient_accumulation_steps: 4
   find_unused_parameters: true
