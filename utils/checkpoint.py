@@ -24,15 +24,18 @@ def build_full_checkpoint_payload(
     best_step: int,
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    slim_payload = build_slim_checkpoint_payload(
+        model=model,
+        epoch=epoch,
+        step=step,
+        best_iou=best_iou,
+        best_step=best_step,
+        cfg=cfg,
+    )
     return {
-        "format": "stage1_full_v1",
-        "model": model.state_dict(),
+        "format": "stage1_resume_v2",
+        **slim_payload,
         "optimizer": optimizer.state_dict(),
-        "epoch": epoch,
-        "step": step,
-        "best_iou": best_iou,
-        "best_step": best_step,
-        "cfg": cfg,
     }
 
 
@@ -72,7 +75,7 @@ def load_stage1_checkpoint_into_model(model, checkpoint: Dict[str, Any]) -> None
     if fmt == "stage1_full_v1" or "model" in checkpoint:
         model.load_state_dict(checkpoint["model"], strict=False)
         return
-    if fmt != "stage1_slim_v1":
+    if fmt not in {"stage1_slim_v1", "stage1_resume_v2"}:
         raise ValueError(f"unsupported checkpoint format: {fmt or 'unknown'}")
     model.adapter.load_state_dict(checkpoint["adapter"], strict=False)
     model.proposer.load_state_dict(checkpoint["proposer"], strict=False)

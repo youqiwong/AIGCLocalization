@@ -26,6 +26,7 @@ from utils.checkpoint import (
     build_full_checkpoint_payload,
     build_slim_checkpoint_payload,
     load_checkpoint,
+    load_stage1_checkpoint_into_model,
     save_checkpoint,
 )
 from utils.metrics import binary_auc_ap, cls_metrics, pixel_metrics
@@ -264,7 +265,7 @@ def main() -> None:
         ckpt = load_checkpoint(resume, map_location="cpu")
         if "optimizer" not in ckpt:
             raise ValueError(f"resume checkpoint must be a full training checkpoint, got slim checkpoint: {resume}")
-        accelerator.unwrap_model(model).load_state_dict(ckpt["model"], strict=False)
+        load_stage1_checkpoint_into_model(accelerator.unwrap_model(model), ckpt)
         opt.load_state_dict(ckpt["optimizer"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         step = int(ckpt.get("step", 0))
