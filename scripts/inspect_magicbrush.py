@@ -21,6 +21,40 @@ def _type_of_value(v: Any) -> str:
     return type(v).__name__
 
 
+def _safe_preview(v: Any, depth: int = 0, max_depth: int = 3) -> Any:
+    """Return JSON-serializable preview without dumping raw binary/image payloads."""
+    if depth > max_depth:
+        return f"<{type(v).__name__}:max_depth>"
+    if v is None:
+        return None
+    if isinstance(v, bytes):
+        return f"<bytes len={len(v)}>"
+    if isinstance(v, str):
+        if len(v) > 240:
+            return v[:240] + "...<truncated>"
+        return v
+    if isinstance(v, (int, float, bool)):
+        return v
+    if isinstance(v, dict):
+        out: Dict[str, Any] = {}
+        # limit key count for wide/nested rows
+        for i, (k, val) in enumerate(v.items()):
+            if i >= 30:
+                out["..."] = "<more_keys_truncated>"
+                break
+            out[str(k)] = _safe_preview(val, depth + 1, max_depth)
+        return out
+    if isinstance(v, list):
+        if not v:
+            return []
+        # preview first few items only
+        head = [_safe_preview(x, depth + 1, max_depth) for x in v[:5]]
+        if len(v) > 5:
+            head.append(f"<... {len(v)-5} more items>")
+        return head
+    return f"<{type(v).__name__}>"
+
+
 def inspect_one_parquet(path: Path) -> Dict[str, Any]:
     pf = pq.ParquetFile(path)
     table = pf.read_row_groups([0], use_threads=False)
@@ -49,7 +83,7 @@ def inspect_one_parquet(path: Path) -> Dict[str, Any]:
         "num_rows_row_group0": table.num_rows,
         "columns": columns,
         "image_like_columns_guess": image_like_cols,
-        "sample_row_preview": row,
+        "sample_row_preview": _safe_preview(row),
     }
 
 
