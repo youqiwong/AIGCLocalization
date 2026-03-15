@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -71,6 +71,12 @@ class Qwen3VLBackbone(nn.Module):
         mode: str = "qwen3vl",
         trainable_vision_blocks: int = 2,
         use_lora: bool = False,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        lora_last_n_blocks: int = 4,
+        lora_target_keywords: Optional[List[str]] = None,
+        lora_include_mlp: bool = False,
         allow_fallback_mock: bool = True,
     ):
         super().__init__()
@@ -79,6 +85,7 @@ class Qwen3VLBackbone(nn.Module):
         self.qwen_ok = False
         self.mock = _MockBackbone()
         self.out_channels = [64, 128, 256, 512]
+        self.vision_path: Optional[str] = None
 
         if mode != "qwen3vl":
             return
@@ -91,13 +98,22 @@ class Qwen3VLBackbone(nn.Module):
         try:
             model = AutoModel.from_pretrained(name_or_path, trust_remote_code=True)
             self.model = model
-            self.vision = self._find_vision_module(model)
+            self.vision_path, self.vision = self._find_vision_module(model)
             self._freeze_modules(trainable_vision_blocks=trainable_vision_blocks, use_lora=use_lora)
+            if use_lora:
+                self._inject_vision_lora(
+                    r=lora_r,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    lora_last_n_blocks=lora_last_n_blocks,
+                    lora_target_keywords=lora_target_keywords,
+                    lora_include_mlp=lora_include_mlp,
+                )
             self.qwen_ok = self.vision is not None
         except Exception:
             self.qwen_ok = False
 
-    def _find_vision_module(self, model: nn.Module) -> nn.Module:
+    def _find_vision_module(self, model: nn.Module) -> Tuple[Optional[str], Optional[nn.Module]]:
         for name in ["visual", "vision_tower", "vision_model", "model.vision_tower", "model.visual"]:
             cur = model
             ok = True
@@ -107,16 +123,19 @@ class Qwen3VLBackbone(nn.Module):
                     break
                 cur = getattr(cur, part)
             if ok:
-                return cur
-        return None
+                return name, cur
+        return None, None
 
-    def _freeze_modules(self, trainable_vision_blocks: int, use_lora: bool) -> None:
-        for p in self.model.parameters():
-            p.requires_grad = False
+    def _set_module_by_path(self, root: nn.Module, path: str, module: nn.Module) -> None:
+        parts = path.split(".")
+        cur = root
+        for p in parts[:-1]:
+            cur = getattr(cur, p)
+        setattr(cur, parts[-1], module)
+
+    def _find_vision_blocks(self) -> Tuple[Optional[str], List[nn.Module]]:
         if self.vision is None:
-            return
-
-        modules = []
+            return None, []
         for maybe in ["blocks", "layers", "encoder.layers"]:
             cur = self.vision
             ok = True
@@ -126,17 +145,96 @@ class Qwen3VLBackbone(nn.Module):
                     break
                 cur = getattr(cur, part)
             if ok and hasattr(cur, "__len__"):
-                modules = list(cur)
-                break
+                return maybe, list(cur)
+        return None, []
 
+    def _freeze_modules(self, trainable_vision_blocks: int, use_lora: bool) -> None:
+        for p in self.model.parameters():
+            p.requires_grad = False
+        if self.vision is None:
+            return
+
+        if use_lora:
+            return
+
+        _, modules = self._find_vision_blocks()
         if modules:
             for m in modules[-trainable_vision_blocks:]:
                 for p in m.parameters():
                     p.requires_grad = True
 
-        # LoRA hook placeholder, kept explicit for future ablation.
-        if use_lora:
-            pass
+    def _inject_vision_lora(
+        self,
+        r: int,
+        lora_alpha: int,
+        lora_dropout: float,
+        lora_last_n_blocks: int,
+        lora_target_keywords: Optional[List[str]],
+        lora_include_mlp: bool,
+    ) -> None:
+        if self.vision is None:
+            raise RuntimeError("vision module not found; cannot apply LoRA")
+        try:
+            from peft import LoraConfig, get_peft_model
+        except Exception as e:
+            raise RuntimeError("peft is required when use_lora=true") from e
+
+        block_path, blocks = self._find_vision_blocks()
+        if not blocks or block_path is None:
+            raise RuntimeError("cannot find vision block list; cannot apply LoRA safely")
+
+        n = len(blocks)
+        start = max(0, n - int(lora_last_n_blocks))
+        selected_idx = list(range(start, n))
+        kw = lora_target_keywords or [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "qkv",
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out",
+            "proj",
+        ]
+        mlp_kw = ["mlp", "fc1", "fc2", "up_proj", "down_proj", "gate_proj"]
+
+        target_modules: List[str] = []
+        for i in selected_idx:
+            block = blocks[i]
+            prefix = f"{block_path}.{i}"
+            for sub_name, sub_module in block.named_modules():
+                if not isinstance(sub_module, nn.Linear):
+                    continue
+                full_name = f"{prefix}.{sub_name}" if sub_name else prefix
+                lfull = full_name.lower()
+                is_attn = any(k in lfull for k in kw)
+                is_mlp = lora_include_mlp and any(k in lfull for k in mlp_kw)
+                if is_attn or is_mlp:
+                    target_modules.append(full_name)
+        target_modules = sorted(set(target_modules))
+        if not target_modules:
+            raise RuntimeError("no LoRA target linear modules found in selected vision blocks")
+
+        lora_cfg = LoraConfig(
+            r=int(r),
+            lora_alpha=int(lora_alpha),
+            lora_dropout=float(lora_dropout),
+            target_modules=target_modules,
+            bias="none",
+        )
+        vision_with_lora = get_peft_model(self.vision, lora_cfg)
+        self.vision = vision_with_lora
+        if self.vision_path is not None:
+            self._set_module_by_path(self.model, self.vision_path, self.vision)
+
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.model.parameters())
+        print(
+            f"[LoRA] vision targets={len(target_modules)} selected_blocks={selected_idx} "
+            f"trainable={trainable}/{total} ({100.0 * trainable / max(total,1):.4f}%)"
+        )
 
     def _forward_qwen_vision(self, image: torch.Tensor) -> Dict[str, torch.Tensor]:
         vision_out = self.vision(pixel_values=image, output_hidden_states=True, return_dict=True)

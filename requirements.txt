@@ -1,6 +1,9 @@
 torch
 torchvision
 transformers
+peft
+accelerate
+tqdm
 pyarrow
 pillow
 pyyaml

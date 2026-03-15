@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -38,7 +39,7 @@ def run_eval(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
     model.eval()
     all_prob, all_label, all_pred_mask, all_gt_mask = [], [], [], []
     with torch.no_grad():
-        for batch in loader:
+        for batch in tqdm(loader, desc="Val", leave=False):
             image = batch["image"].to(device)
             label = batch["label"].to(device)
             mask = batch["mask"].to(device)
@@ -93,19 +94,24 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg["train"].get("amp", True) and device.type == "cuda"))
 
     start_epoch = 0
+    step = 0
     best_iou = -1.0
+    best_step = -1
+    val_every_steps = int(cfg["train"].get("val_every_steps", 500))
     resume = cfg["train"].get("resume", "")
     if resume:
         ckpt = load_checkpoint(resume, map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=False)
         opt.load_state_dict(ckpt["optimizer"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
+        step = int(ckpt.get("step", 0))
         best_iou = float(ckpt.get("best_iou", -1.0))
-
-    step = 0
+        best_step = int(ckpt.get("best_step", -1))
     for epoch in range(start_epoch, int(cfg["train"]["epochs"])):
         model.train()
-        for batch in train_loader:
+        last_eval_step = -1
+        pbar = tqdm(train_loader, desc=f"Train Epoch {epoch}", leave=True)
+        for batch in pbar:
             image = batch["image"].to(device)
             label = batch["label"].to(device)
             gt_mask = batch["mask"].to(device)
@@ -124,6 +130,13 @@ def main() -> None:
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
+            pbar.set_postfix(
+                loss=f"{float(loss.item()):.4f}",
+                det=f"{float(l_det.item()):.4f}",
+                heat=f"{float(l_heat.item()):.4f}",
+                mask=f"{float(l_mask.item()):.4f}",
+                step=step,
+            )
 
             if step % int(cfg["train"]["log_every"]) == 0:
                 print(
@@ -146,20 +159,66 @@ def main() -> None:
                     pred_mask=out["mask0"].detach().cpu(),
                     path=str(out_dir / "vis" / f"train_step{step}.png"),
                 )
+            if (step + 1) % val_every_steps == 0:
+                val_metrics = run_eval(model, val_loader, device=device)
+                print(json.dumps({"epoch": epoch, "step": step + 1, "val": val_metrics}, ensure_ascii=False))
+                save_checkpoint(
+                    str(out_dir / "last.pt"),
+                    {
+                        "model": model.state_dict(),
+                        "optimizer": opt.state_dict(),
+                        "epoch": epoch,
+                        "step": step + 1,
+                        "best_iou": best_iou,
+                        "best_step": best_step,
+                    },
+                )
+                if val_metrics["iou"] > best_iou:
+                    best_iou = val_metrics["iou"]
+                    best_step = step + 1
+                    save_checkpoint(
+                        str(out_dir / "best_by_iou.pt"),
+                        {
+                            "model": model.state_dict(),
+                            "optimizer": opt.state_dict(),
+                            "epoch": epoch,
+                            "step": step + 1,
+                            "best_iou": best_iou,
+                            "best_step": best_step,
+                        },
+                    )
+                model.train()
+                last_eval_step = step + 1
             step += 1
 
-        val_metrics = run_eval(model, val_loader, device=device)
-        print(json.dumps({"epoch": epoch, "val": val_metrics}, ensure_ascii=False))
+        if last_eval_step != step:
+            val_metrics = run_eval(model, val_loader, device=device)
+            print(json.dumps({"epoch": epoch, "step": step, "val": val_metrics}, ensure_ascii=False))
+            if val_metrics["iou"] > best_iou:
+                best_iou = val_metrics["iou"]
+                best_step = step
+                save_checkpoint(
+                    str(out_dir / "best_by_iou.pt"),
+                    {
+                        "model": model.state_dict(),
+                        "optimizer": opt.state_dict(),
+                        "epoch": epoch,
+                        "step": step,
+                        "best_iou": best_iou,
+                        "best_step": best_step,
+                    },
+                )
         save_checkpoint(
             str(out_dir / "last.pt"),
-            {"model": model.state_dict(), "optimizer": opt.state_dict(), "epoch": epoch, "best_iou": best_iou},
+            {
+                "model": model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "epoch": epoch,
+                "step": step,
+                "best_iou": best_iou,
+                "best_step": best_step,
+            },
         )
-        if val_metrics["iou"] > best_iou:
-            best_iou = val_metrics["iou"]
-            save_checkpoint(
-                str(out_dir / "best_by_iou.pt"),
-                {"model": model.state_dict(), "optimizer": opt.state_dict(), "epoch": epoch, "best_iou": best_iou},
-            )
 
 
 if __name__ == "__main__":

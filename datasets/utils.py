@@ -9,8 +9,15 @@ from PIL import Image
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
     samples: List[Dict[str, Any]] = []
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        tqdm = None
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        iterator = f
+        if tqdm is not None:
+            iterator = tqdm(f, desc=f"Loading manifest {Path(path).name}", leave=False)
+        for line in iterator:
             line = line.strip()
             if not line:
                 continue

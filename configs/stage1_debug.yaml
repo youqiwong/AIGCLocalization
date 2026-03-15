@@ -17,8 +17,14 @@ model:
     name_or_path: /home/tione/notebook/models/modelscope/hub/models/Qwen/Qwen3-VL-8B-Instruct
     mode: qwen3vl
     trainable_vision_blocks: 2
-    use_lora: false
-    allow_fallback_mock: true
+    use_lora: true
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_last_n_blocks: 4
+    lora_target_keywords: ["q_proj", "k_proj", "v_proj", "o_proj", "qkv", "to_q", "to_k", "to_v", "to_out"]
+    lora_include_mlp: false
+    allow_fallback_mock: false
   adapter:
     type: suspicion_gated
     out_channels: 256
@@ -34,6 +40,7 @@ train:
   weight_decay: 0.01
   log_every: 20
   vis_every: 200
+  val_every_steps: 500
   amp: true
   resume: ""
   lambda_det: 1.0

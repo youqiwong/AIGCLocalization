@@ -20,6 +20,10 @@ python scripts/build_magicbrush_manifest.py \
   --output-dir artifacts/manifests \
   --mode debug
 
+python scripts/inspect_qwen3vl_modules.py \
+  --model-path /home/tione/notebook/models/modelscope/hub/models/Qwen/Qwen3-VL-8B-Instruct \
+  --only-linear
+
 python scripts/train_stage1.py --config configs/stage1_debug.yaml
 python scripts/eval_stage1.py --config configs/stage1_debug.yaml --split test
 ```
@@ -30,3 +34,4 @@ python scripts/eval_stage1.py --config configs/stage1_debug.yaml --split test
 - Multi-turn edits are expanded into independent samples, and each source group also generates one clean sample.
 - If a mask is missing for an edited turn, building the manifest raises an error with the sample id.
 - Manifest stores parquet index references (path + row_group + row index + field names), not embedded base64 image bytes.
+- Training uses tqdm progress bars for manifest loading, train steps, and val loops; default validation frequency is every 500 steps.
