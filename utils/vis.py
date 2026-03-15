@@ -6,6 +6,10 @@ from torchvision.utils import save_image
 
 
 def _heatmap_to_rgb(heatmap: torch.Tensor) -> torch.Tensor:
+    if heatmap.dim() == 3 and heatmap.shape[0] == 1:
+        heatmap = heatmap[0]
+    elif heatmap.dim() != 2:
+        raise ValueError(f"expected heatmap shape [H,W] or [1,H,W], got {tuple(heatmap.shape)}")
     heatmap = heatmap.clamp(0.0, 1.0)
     low = heatmap <= 0.5
     high = ~low
