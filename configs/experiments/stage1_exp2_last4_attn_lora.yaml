@@ -41,12 +41,12 @@ train:
   epochs: 5
   lr: 0.0001
   weight_decay: 0.01
-  log_every: 1
+  log_every: 10
   print_train_log: false
-  vis_every: 1
+  vis_every: 50
   val_every_steps: 500
   mixed_precision: bf16
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   find_unused_parameters: true
   use_wandb: true
   wandb_project: aigc_stage1_magicbrush

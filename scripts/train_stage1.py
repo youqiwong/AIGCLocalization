@@ -175,22 +175,22 @@ def main() -> None:
     for epoch in range(start_epoch, int(train_cfg["epochs"])):
         model.train()
         last_eval_step = -1
+        opt.zero_grad(set_to_none=True)
         pbar = tqdm(
-            train_loader,
+            total=len(train_loader),
             desc=f"Train Epoch {epoch}",
             leave=True,
             disable=not accelerator.is_local_main_process,
             dynamic_ncols=True,
-            mininterval=0.0,
+            mininterval=0.1,
         )
-        for batch in pbar:
+        for batch in train_loader:
             with accelerator.accumulate(model):
                 image = batch["image"]
                 pixel_values = batch["pixel_values"]
                 image_grid_thw = batch["image_grid_thw"]
                 label = batch["label"]
                 gt_mask = batch["mask"]
-                opt.zero_grad(set_to_none=True)
                 out = model(pixel_values, image_grid_thw, out_hw=gt_mask.shape[-2:])
                 heat_target = F.interpolate(gt_mask, size=out["heatmap"].shape[-2:], mode="nearest")
                 l_det = detection_bce_loss(out["p_edit"], label)
@@ -203,15 +203,20 @@ def main() -> None:
                 )
                 accelerator.backward(loss)
                 opt.step()
+                opt.zero_grad(set_to_none=True)
 
-            pbar.set_postfix(
-                loss=f"{float(loss.item()):.4f}",
-                det=f"{float(l_det.item()):.4f}",
-                heat=f"{float(l_heat.item()):.4f}",
-                mask=f"{float(l_mask.item()):.4f}",
-                step=step,
-                refresh=True,
-            )
+            step += 1
+
+            if accelerator.is_local_main_process:
+                pbar.update(1)
+                pbar.set_postfix(
+                    loss=f"{float(loss.item()):.4f}",
+                    det=f"{float(l_det.item()):.4f}",
+                    heat=f"{float(l_heat.item()):.4f}",
+                    mask=f"{float(l_mask.item()):.4f}",
+                    step=step,
+                    refresh=True,
+                )
 
             if step % int(train_cfg["log_every"]) == 0:
                 if bool(train_cfg.get("print_train_log", False)):
@@ -239,21 +244,23 @@ def main() -> None:
                         step=step,
                     )
 
-            if step % int(train_cfg["vis_every"]) == 0 and accelerator.is_main_process:
+            vis_every = int(train_cfg.get("vis_every", 0))
+            if vis_every > 0 and step % vis_every == 0 and accelerator.is_main_process:
+                nvis = min(2, image.shape[0])
                 save_triplet_vis(
-                    image=accelerator.gather_for_metrics(image.detach()).cpu(),
-                    gt_mask=accelerator.gather_for_metrics(gt_mask.detach()).cpu(),
-                    heatmap=accelerator.gather_for_metrics(out["heatmap"].detach()).cpu(),
-                    pred_mask=accelerator.gather_for_metrics(out["mask0"].detach()).cpu(),
+                    image=image[:nvis].detach().float().cpu(),
+                    gt_mask=gt_mask[:nvis].detach().float().cpu(),
+                    heatmap=out["heatmap"][:nvis].detach().float().cpu(),
+                    pred_mask=out["mask0"][:nvis].detach().float().cpu(),
                     path=str(out_dir / "vis" / f"train_step{step}.png"),
                 )
 
-            if (step + 1) % val_every_steps == 0:
+            if step % val_every_steps == 0:
                 accelerator.wait_for_everyone()
                 val_metrics = run_eval(model, val_loader, accelerator=accelerator)
-                accelerator.print(json.dumps({"epoch": epoch, "step": step + 1, "val": val_metrics}, ensure_ascii=False))
+                accelerator.print(json.dumps({"epoch": epoch, "step": step, "val": val_metrics}, ensure_ascii=False))
                 if use_wandb:
-                    accelerator.log({f"val/{k}": float(v) for k, v in val_metrics.items()}, step=step + 1)
+                    accelerator.log({f"val/{k}": float(v) for k, v in val_metrics.items()}, step=step)
                 if accelerator.is_main_process:
                     save_checkpoint(
                         str(out_dir / "last.pt"),
@@ -261,14 +268,14 @@ def main() -> None:
                             "model": accelerator.unwrap_model(model).state_dict(),
                             "optimizer": opt.state_dict(),
                             "epoch": epoch,
-                            "step": step + 1,
+                            "step": step,
                             "best_iou": best_iou,
                             "best_step": best_step,
                         },
                     )
                 if val_metrics["iou"] > best_iou:
                     best_iou = val_metrics["iou"]
-                    best_step = step + 1
+                    best_step = step
                     if accelerator.is_main_process:
                         save_checkpoint(
                             str(out_dir / "best_by_iou.pt"),
@@ -276,14 +283,13 @@ def main() -> None:
                                 "model": accelerator.unwrap_model(model).state_dict(),
                                 "optimizer": opt.state_dict(),
                                 "epoch": epoch,
-                                "step": step + 1,
+                                "step": step,
                                 "best_iou": best_iou,
                                 "best_step": best_step,
                             },
                         )
                 model.train()
-                last_eval_step = step + 1
-            step += 1
+                last_eval_step = step
 
         if last_eval_step != step:
             accelerator.wait_for_everyone()
@@ -306,6 +312,7 @@ def main() -> None:
                             "best_step": best_step,
                         },
                     )
+        pbar.close()
         if accelerator.is_main_process:
             save_checkpoint(
                 str(out_dir / "last.pt"),
