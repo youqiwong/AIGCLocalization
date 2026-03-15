@@ -4,6 +4,7 @@ import pyarrow.parquet as pq
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision.transforms import functional as TF
 
 from .transforms import Stage1Transform
 from .utils import decode_image_like, decode_mask_like, load_jsonl
@@ -30,10 +31,13 @@ class _ParquetTurnTableReader:
 
 
 class MagicBrushDataset(Dataset):
-    def __init__(self, manifest_path: str, image_size: int):
+    def __init__(self, manifest_path: str, image_size: int, processor_name_or_path: str):
         self.samples = load_jsonl(manifest_path)
         self.transform = Stage1Transform(image_size=image_size)
         self.turn_reader = _ParquetTurnTableReader()
+        from transformers import AutoImageProcessor
+
+        self.image_processor = AutoImageProcessor.from_pretrained(processor_name_or_path, trust_remote_code=True)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -61,11 +65,19 @@ class MagicBrushDataset(Dataset):
                 mask = Image.new("L", image.size, color=0)
             else:
                 mask = decode_mask_like(sample["mask"])
-        out = self.transform(image=image, mask=mask)
+        image, mask = self.transform.resize_pair(image=image, mask=mask)
+        image_inputs = self.image_processor(images=image, do_resize=False, return_tensors="pt")
+        pixel_values = image_inputs["pixel_values"]
+        image_grid_thw = image_inputs["image_grid_thw"]
+        out = {
+            "image": TF.to_tensor(image),
+            "mask": (TF.to_tensor(mask)[:1] > 0.5).float(),
+        }
 
-        # image: Tensor[3,H,W], mask: Tensor[1,H,W], label: Tensor[]
         return {
             "image": out["image"],
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
             "mask": out["mask"],
             "label": torch.tensor(float(sample["label"]), dtype=torch.float32),
             "meta": {
@@ -74,3 +86,16 @@ class MagicBrushDataset(Dataset):
                 "source_group_id": sample["source_group_id"],
             },
         }
+
+
+def collate_magicbrush_batch(batch):
+    pixel_values = [item["pixel_values"].squeeze(0) for item in batch]
+    image_grid_thw = [item["image_grid_thw"].reshape(-1, 3) for item in batch]
+    return {
+        "image": torch.stack([item["image"] for item in batch], dim=0),
+        "pixel_values": torch.cat(pixel_values, dim=0),
+        "image_grid_thw": torch.cat(image_grid_thw, dim=0),
+        "mask": torch.stack([item["mask"] for item in batch], dim=0),
+        "label": torch.stack([item["label"] for item in batch], dim=0),
+        "meta": [item["meta"] for item in batch],
+    }

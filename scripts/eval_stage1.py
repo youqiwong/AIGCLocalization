@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aigc_datasets.magicbrush_dataset import MagicBrushDataset
+from aigc_datasets.magicbrush_dataset import MagicBrushDataset, collate_magicbrush_batch
 from models.stage1_model import Stage1ForgeryModel
 from utils.checkpoint import load_checkpoint
 from utils.metrics import binary_auc_ap, cls_metrics, pixel_metrics
@@ -29,13 +29,18 @@ def main() -> None:
     device = torch.device(cfg.get("device", "cuda") if torch.cuda.is_available() else "cpu")
     ckpt_path = args.checkpoint or str(Path(cfg["output_dir"]) / "best_by_iou.pt")
 
-    ds = MagicBrushDataset(manifest_path=cfg["data"]["manifests"][args.split], image_size=cfg["data"]["image_size"])
+    ds = MagicBrushDataset(
+        manifest_path=cfg["data"]["manifests"][args.split],
+        image_size=cfg["data"]["image_size"],
+        processor_name_or_path=cfg["model"]["backbone"]["name_or_path"],
+    )
     loader = DataLoader(
         ds,
         batch_size=cfg["data"]["batch_size"],
         shuffle=False,
         num_workers=cfg["data"]["num_workers"],
         pin_memory=True,
+        collate_fn=collate_magicbrush_batch,
     )
 
     model = Stage1ForgeryModel(cfg["model"]).to(device)
@@ -48,9 +53,11 @@ def main() -> None:
     with torch.no_grad():
         for batch in tqdm(loader, desc=f"Eval-{args.split}"):
             image = batch["image"].to(device)
+            pixel_values = batch["pixel_values"].to(device)
+            image_grid_thw = batch["image_grid_thw"].to(device)
             label = batch["label"].to(device)
             mask = batch["mask"].to(device)
-            out = model(image)
+            out = model(pixel_values, image_grid_thw, out_hw=mask.shape[-2:])
             probs.append(out["p_edit"].cpu())
             labels.append(label.cpu())
             pred_masks.append(out["mask0"].cpu())

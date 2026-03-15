@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aigc_datasets.magicbrush_dataset import MagicBrushDataset
+from aigc_datasets.magicbrush_dataset import MagicBrushDataset, collate_magicbrush_batch
 from losses import bce_dice_loss, detection_bce_loss, focal_heatmap_loss
 from models.stage1_model import Stage1ForgeryModel
 from utils.checkpoint import load_checkpoint, save_checkpoint
@@ -32,9 +32,27 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def build_loader(manifest: str, image_size: int, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
-    ds = MagicBrushDataset(manifest_path=manifest, image_size=image_size)
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
+def build_loader(
+    manifest: str,
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    processor_name_or_path: str,
+) -> DataLoader:
+    ds = MagicBrushDataset(
+        manifest_path=manifest,
+        image_size=image_size,
+        processor_name_or_path=processor_name_or_path,
+    )
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_magicbrush_batch,
+    )
 
 
 def run_eval(model: torch.nn.Module, loader: DataLoader, accelerator: Accelerator) -> Dict[str, float]:
@@ -44,9 +62,11 @@ def run_eval(model: torch.nn.Module, loader: DataLoader, accelerator: Accelerato
         vbar = tqdm(loader, desc="Val", leave=False, disable=not accelerator.is_local_main_process)
         for batch in vbar:
             image = batch["image"]
+            pixel_values = batch["pixel_values"]
+            image_grid_thw = batch["image_grid_thw"]
             label = batch["label"]
             mask = batch["mask"]
-            out = model(image)
+            out = model(pixel_values, image_grid_thw, out_hw=mask.shape[-2:])
 
             prob = accelerator.gather_for_metrics(out["p_edit"].detach())
             lab = accelerator.gather_for_metrics(label.detach())
@@ -96,6 +116,7 @@ def main() -> None:
         batch_size=cfg["data"]["batch_size"],
         num_workers=cfg["data"]["num_workers"],
         shuffle=True,
+        processor_name_or_path=cfg["model"]["backbone"]["name_or_path"],
     )
     val_loader = build_loader(
         manifest=cfg["data"]["manifests"]["val"],
@@ -103,6 +124,7 @@ def main() -> None:
         batch_size=cfg["data"]["batch_size"],
         num_workers=cfg["data"]["num_workers"],
         shuffle=False,
+        processor_name_or_path=cfg["model"]["backbone"]["name_or_path"],
     )
 
     model = Stage1ForgeryModel(cfg["model"])
@@ -144,10 +166,12 @@ def main() -> None:
         for batch in pbar:
             with accelerator.accumulate(model):
                 image = batch["image"]
+                pixel_values = batch["pixel_values"]
+                image_grid_thw = batch["image_grid_thw"]
                 label = batch["label"]
                 gt_mask = batch["mask"]
                 opt.zero_grad(set_to_none=True)
-                out = model(image)
+                out = model(pixel_values, image_grid_thw, out_hw=gt_mask.shape[-2:])
                 heat_target = F.interpolate(gt_mask, size=out["heatmap"].shape[-2:], mode="nearest")
                 l_det = detection_bce_loss(out["p_edit"], label)
                 l_heat = focal_heatmap_loss(out["heatmap"], heat_target)

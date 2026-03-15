@@ -9,9 +9,13 @@ class Stage1Transform:
     def __init__(self, image_size: int):
         self.image_size = image_size
 
-    def __call__(self, image: Image.Image, mask: Image.Image) -> Dict[str, torch.Tensor]:
+    def resize_pair(self, image: Image.Image, mask: Image.Image):
         image = F.resize(image, [self.image_size, self.image_size], antialias=True)
         mask = F.resize(mask, [self.image_size, self.image_size], interpolation=Image.NEAREST)
+        return image, mask
+
+    def __call__(self, image: Image.Image, mask: Image.Image) -> Dict[str, torch.Tensor]:
+        image, mask = self.resize_pair(image, mask)
 
         image_t = F.to_tensor(image)  # [3,H,W], float32 in [0,1]
         mask_t = F.to_tensor(mask)[:1]  # [1,H,W]

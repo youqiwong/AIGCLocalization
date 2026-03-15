@@ -40,12 +40,11 @@ class Stage1ForgeryModel(nn.Module):
         self.topk_regions = cfg["proposer"].get("topk_regions", 8)
         self.region_window = cfg["proposer"].get("region_window", 48)
 
-    def forward(self, image: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # image: [B,3,H,W]
-        feats = self.backbone(image)
+    def forward(self, image: torch.Tensor, image_grid_thw: torch.Tensor, out_hw) -> Dict[str, torch.Tensor]:
+        feats = self.backbone(image, image_grid_thw)
         pyr = self.adapter(feats)
         prop = self.proposer(pyr)
-        dec = self.decoder(pyr, prop["heatmap"], out_hw=image.shape[-2:])
+        dec = self.decoder(pyr, prop["heatmap"], out_hw=out_hw)
         regions = build_candidate_regions(prop["heatmap"], topk=self.topk_regions, window=self.region_window)
         return {
             "p_edit": prop["p_edit"],  # [B]

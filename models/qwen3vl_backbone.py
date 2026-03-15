@@ -101,6 +101,9 @@ class Qwen3VLBackbone(nn.Module):
             model = AutoModel.from_pretrained(name_or_path, trust_remote_code=True)
             self.model = model
             self.vision_path, self.vision = self._find_vision_module(model)
+            if self.vision is not None:
+                out_hidden = int(getattr(self.vision.config, "out_hidden_size", getattr(self.vision.config, "hidden_size", 512)))
+                self.out_channels = [out_hidden] * 4
             self._freeze_modules(trainable_vision_blocks=trainable_vision_blocks, use_lora=use_lora)
             if use_lora:
                 self._inject_vision_lora(
@@ -245,25 +248,41 @@ class Qwen3VLBackbone(nn.Module):
             rf"(attn\.(qkv|proj)|mlp\.(linear_fc1|linear_fc2))$"
         )
 
-    def _forward_qwen_vision(self, image: torch.Tensor) -> Dict[str, torch.Tensor]:
-        vision_out = self.vision(pixel_values=image, output_hidden_states=True, return_dict=True)
-        hs = getattr(vision_out, "hidden_states", None)
-        if hs is None:
-            last = vision_out.last_hidden_state
-            hs = (last, last, last, last)
-        feats = _pick_hidden_states(tuple(hs))
-        feats2d = [_reshape_tokens_to_2d(f) if f.dim() == 3 else f for f in feats]
+    def _tokens_to_feature_map(self, tokens: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
+        merge_size = int(getattr(self.vision, "spatial_merge_size", 2))
+        split_sizes = (image_grid_thw.prod(-1) // (merge_size**2)).tolist()
+        per_image_tokens = torch.split(tokens, split_sizes, dim=0)
+        feats = []
+        for sample_tokens, sample_grid in zip(per_image_tokens, image_grid_thw):
+            grid_t, grid_h, grid_w = [int(v) for v in sample_grid.tolist()]
+            merged_h = max(1, grid_h // merge_size)
+            merged_w = max(1, grid_w // merge_size)
+            expected = grid_t * merged_h * merged_w
+            if sample_tokens.shape[0] != expected:
+                feat = _reshape_tokens_to_2d(sample_tokens.unsqueeze(0)).squeeze(0)
+            else:
+                feat = sample_tokens.view(grid_t, merged_h, merged_w, sample_tokens.shape[-1])
+                feat = feat.permute(3, 0, 1, 2).reshape(sample_tokens.shape[-1], grid_t * merged_h, merged_w)
+            feats.append(feat)
+        return torch.stack(feats, dim=0)
+
+    def _forward_qwen_vision(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> Dict[str, torch.Tensor]:
+        hidden_states, deepstack_hidden_states = self.vision(pixel_values, grid_thw=image_grid_thw)
+        feats = list(deepstack_hidden_states) + [hidden_states]
+        feats = _pick_hidden_states(tuple(feats))
+        feats2d = [self._tokens_to_feature_map(f, image_grid_thw) if f.dim() == 2 else f for f in feats]
         while len(feats2d) < 4:
             feats2d.insert(0, feats2d[0])
         f1, f2, f3, f4 = feats2d[-4:]
         return {"feat_l1": f1, "feat_l2": f2, "feat_l3": f3, "feat_l4": f4}
 
-    def forward(self, image: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # image: Tensor[B,3,H,W]
+    def forward(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> Dict[str, torch.Tensor]:
         if self.qwen_ok:
             try:
-                return self._forward_qwen_vision(image)
+                return self._forward_qwen_vision(pixel_values, image_grid_thw)
             except Exception:
                 if not self.allow_fallback_mock:
                     raise
-        return self.mock(image)
+        if pixel_values.dim() != 4:
+            raise RuntimeError("Qwen3-VL backbone is unavailable; fallback mock requires image tensors shaped [B,3,H,W].")
+        return self.mock(pixel_values)
