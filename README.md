@@ -29,3 +29,4 @@ python scripts/eval_stage1.py --config configs/stage1_debug.yaml --split test
 - The parser does not assume parquet schema up front. It inspects columns and infers likely image/mask/edit-turn fields.
 - Multi-turn edits are expanded into independent samples, and each source group also generates one clean sample.
 - If a mask is missing for an edited turn, building the manifest raises an error with the sample id.
+- Manifest stores parquet index references (path + row_group + row index + field names), not embedded base64 image bytes.

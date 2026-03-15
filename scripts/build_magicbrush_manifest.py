@@ -136,7 +136,7 @@ def _build_records_from_file(path: Path, split: str) -> List[Dict[str, Any]]:
         for rg in range(pf.num_row_groups):
             table = pf.read_row_group(rg, use_threads=True)
             rows = table.to_pylist()
-            for row in rows:
+            for row_idx, row in enumerate(rows):
                 img_id = str(row["img_id"])
                 source_group_id = f"{split}-{img_id}"
                 turn_index = int(row["turn_index"])
@@ -151,46 +151,66 @@ def _build_records_from_file(path: Path, split: str) -> List[Dict[str, Any]]:
                 if img_id not in groups:
                     groups[img_id] = {
                         "source_group_id": source_group_id,
-                        "clean_source": src,
+                        "clean_ref": {
+                            "parquet_path": str(path),
+                            "row_group": rg,
+                            "row_index_in_group": row_idx,
+                            "image_field": "source_img",
+                            "mask_mode": "zero",
+                        },
                         "clean_turn": turn_index,
                         "turns": [],
                     }
                 else:
                     # Prefer source image from earliest turn as the clean input image.
                     if turn_index < groups[img_id]["clean_turn"]:
-                        groups[img_id]["clean_source"] = src
+                        groups[img_id]["clean_ref"] = {
+                            "parquet_path": str(path),
+                            "row_group": rg,
+                            "row_index_in_group": row_idx,
+                            "image_field": "source_img",
+                            "mask_mode": "zero",
+                        }
                         groups[img_id]["clean_turn"] = turn_index
 
-                groups[img_id]["turns"].append((turn_index, tgt, msk))
+                groups[img_id]["turns"].append(
+                    {
+                        "turn_index": turn_index,
+                        "parquet_path": str(path),
+                        "row_group": rg,
+                        "row_index_in_group": row_idx,
+                        "image_field": "target_img",
+                        "mask_field": "mask_img",
+                    }
+                )
 
         for g in groups.values():
-            clean_source = g["clean_source"]
-            if clean_source is None:
+            clean_ref = g["clean_ref"]
+            if clean_ref is None:
                 raise ValueError(f"source_img missing for {g['source_group_id']}")
             records.append(
                 {
                     "sample_id": f"{g['source_group_id']}-clean",
-                    "image": _to_jsonable(clean_source),
-                    "mask": "__ZERO__",
                     "label": 0,
                     "turn_index": 0,
                     "source_group_id": g["source_group_id"],
                     "dataset": "MagicBrush",
                     "split": split,
+                    "storage": {"type": "magicbrush_parquet_turn_table", **clean_ref},
                 }
             )
-            for turn_index, tgt, msk in sorted(g["turns"], key=lambda x: x[0]):
+            for turn in sorted(g["turns"], key=lambda x: x["turn_index"]):
+                turn_index = int(turn["turn_index"])
                 sid = f"{g['source_group_id']}-turn{turn_index}"
                 records.append(
                     {
                         "sample_id": sid,
-                        "image": _to_jsonable(tgt),
-                        "mask": _to_jsonable(msk),
                         "label": 1,
-                        "turn_index": int(turn_index),
+                        "turn_index": turn_index,
                         "source_group_id": g["source_group_id"],
                         "dataset": "MagicBrush",
                         "split": split,
+                        "storage": {"type": "magicbrush_parquet_turn_table", **turn},
                     }
                 )
         return records
@@ -305,6 +325,8 @@ def main() -> None:
         "dev_total": len(dev_records),
         "debug_train_out": len(train_out) if args.mode == "debug" else None,
         "debug_val_out": len(val_out) if args.mode == "debug" else None,
+        "sample_train_record": (train_out[0] if args.mode == "debug" and train_out else None),
+        "sample_val_record": (val_out[0] if args.mode == "debug" and val_out else None),
     }
     print(json.dumps(stats, indent=2, ensure_ascii=False))
 
