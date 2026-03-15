@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 import pyarrow.parquet as pq
+from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -133,10 +134,10 @@ def _build_records_from_file(path: Path, split: str) -> List[Dict[str, Any]]:
 
     if has_turn_table:
         groups: Dict[str, Dict[str, Any]] = {}
-        for rg in range(pf.num_row_groups):
+        for rg in tqdm(range(pf.num_row_groups), desc=f"{path.name} row-groups", leave=False):
             table = pf.read_row_group(rg, use_threads=True)
             rows = table.to_pylist()
-            for row_idx, row in enumerate(rows):
+            for row_idx, row in enumerate(tqdm(rows, desc=f"{path.name} rg{rg}", leave=False)):
                 img_id = str(row["img_id"])
                 source_group_id = f"{split}-{img_id}"
                 turn_index = int(row["turn_index"])
@@ -216,10 +217,10 @@ def _build_records_from_file(path: Path, split: str) -> List[Dict[str, Any]]:
         return records
 
     global_row_idx = 0
-    for rg in range(pf.num_row_groups):
+    for rg in tqdm(range(pf.num_row_groups), desc=f"{path.name} row-groups", leave=False):
         table = pf.read_row_group(rg, use_threads=True)
         rows = table.to_pylist()
-        for row in rows:
+        for row in tqdm(rows, desc=f"{path.name} rg{rg}", leave=False):
             source, outputs, masks = _extract_turn_payloads(row, fields)
             if source is None:
                 global_row_idx += 1
@@ -299,11 +300,11 @@ def main() -> None:
         raise FileNotFoundError(f"no train/dev parquet found under {data_root}")
 
     train_records: List[Dict[str, Any]] = []
-    for p in train_files:
+    for p in tqdm(train_files, desc="Build train manifests"):
         train_records.extend(_build_records_from_file(p, split="train"))
 
     dev_records: List[Dict[str, Any]] = []
-    for p in dev_files:
+    for p in tqdm(dev_files, desc="Build dev manifests"):
         dev_records.extend(_build_records_from_file(p, split="dev"))
 
     if args.mode == "debug":

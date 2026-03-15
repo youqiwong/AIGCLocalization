@@ -1,5 +1,5 @@
 seed: 42
-output_dir: outputs/stage1_debug
+output_dir: outputs/exp3_last4_attn_mlp_lora
 device: cuda
 
 data:
@@ -16,14 +16,14 @@ model:
   backbone:
     name_or_path: /home/tione/notebook/models/modelscope/hub/models/Qwen/Qwen3-VL-8B-Instruct
     mode: qwen3vl
-    trainable_vision_blocks: 2
+    trainable_vision_blocks: 0
     use_lora: true
     lora_r: 16
     lora_alpha: 32
     lora_dropout: 0.05
     lora_last_n_blocks: 4
-    lora_target_regex: ""
-    lora_include_mlp: false
+    lora_target_regex: "^blocks\\.(23|24|25|26)\\.(attn\\.(qkv|proj)|mlp\\.(linear_fc1|linear_fc2))$"
+    lora_include_mlp: true
     allow_fallback_mock: false
   adapter:
     type: suspicion_gated

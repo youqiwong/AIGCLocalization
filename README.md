@@ -28,6 +28,21 @@ python scripts/train_stage1.py --config configs/stage1_debug.yaml
 python scripts/eval_stage1.py --config configs/stage1_debug.yaml --split test
 ```
 
+## Experiment presets
+
+Three experiment presets are provided:
+- `configs/experiments/stage1_exp1_baseline_no_lora.yaml`
+- `configs/experiments/stage1_exp2_last4_attn_lora.yaml`
+- `configs/experiments/stage1_exp3_last4_attn_mlp_lora.yaml`
+
+Run them in order:
+
+```bash
+bash scripts/train/run_stage1_exp1_baseline_no_lora.sh
+bash scripts/train/run_stage1_exp2_last4_attn_lora.sh
+bash scripts/train/run_stage1_exp3_last4_attn_mlp_lora.sh
+```
+
 ## Notes
 
 - The parser does not assume parquet schema up front. It inspects columns and infers likely image/mask/edit-turn fields.

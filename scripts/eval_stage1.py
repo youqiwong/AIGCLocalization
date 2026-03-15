@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 import yaml
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -45,7 +46,7 @@ def main() -> None:
     probs, labels, pred_masks, gt_masks = [], [], [], []
     vis_saved = False
     with torch.no_grad():
-        for batch in loader:
+        for batch in tqdm(loader, desc=f"Eval-{args.split}"):
             image = batch["image"].to(device)
             label = batch["label"].to(device)
             mask = batch["mask"].to(device)

@@ -1,3 +1,4 @@
+import re
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -75,7 +76,7 @@ class Qwen3VLBackbone(nn.Module):
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
         lora_last_n_blocks: int = 4,
-        lora_target_keywords: Optional[List[str]] = None,
+        lora_target_regex: Optional[str] = None,
         lora_include_mlp: bool = False,
         allow_fallback_mock: bool = True,
     ):
@@ -106,7 +107,7 @@ class Qwen3VLBackbone(nn.Module):
                     lora_alpha=lora_alpha,
                     lora_dropout=lora_dropout,
                     lora_last_n_blocks=lora_last_n_blocks,
-                    lora_target_keywords=lora_target_keywords,
+                    lora_target_regex=lora_target_regex,
                     lora_include_mlp=lora_include_mlp,
                 )
             self.qwen_ok = self.vision is not None
@@ -169,7 +170,7 @@ class Qwen3VLBackbone(nn.Module):
         lora_alpha: int,
         lora_dropout: float,
         lora_last_n_blocks: int,
-        lora_target_keywords: Optional[List[str]],
+        lora_target_regex: Optional[str],
         lora_include_mlp: bool,
     ) -> None:
         if self.vision is None:
@@ -186,42 +187,32 @@ class Qwen3VLBackbone(nn.Module):
         n = len(blocks)
         start = max(0, n - int(lora_last_n_blocks))
         selected_idx = list(range(start, n))
-        kw = lora_target_keywords or [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "qkv",
-            "to_q",
-            "to_k",
-            "to_v",
-            "to_out",
-            "proj",
-        ]
-        mlp_kw = ["mlp", "fc1", "fc2", "up_proj", "down_proj", "gate_proj"]
 
-        target_modules: List[str] = []
-        for i in selected_idx:
-            block = blocks[i]
-            prefix = f"{block_path}.{i}"
-            for sub_name, sub_module in block.named_modules():
-                if not isinstance(sub_module, nn.Linear):
-                    continue
-                full_name = f"{prefix}.{sub_name}" if sub_name else prefix
-                lfull = full_name.lower()
-                is_attn = any(k in lfull for k in kw)
-                is_mlp = lora_include_mlp and any(k in lfull for k in mlp_kw)
-                if is_attn or is_mlp:
-                    target_modules.append(full_name)
-        target_modules = sorted(set(target_modules))
-        if not target_modules:
-            raise RuntimeError("no LoRA target linear modules found in selected vision blocks")
+        if lora_target_regex:
+            target_regex = lora_target_regex
+        else:
+            ids = "|".join(str(i) for i in selected_idx)
+            if lora_include_mlp:
+                target_regex = (
+                    rf"^{block_path}\.({ids})\."
+                    rf"(attn\.(qkv|proj)|mlp\.(linear_fc1|linear_fc2))$"
+                )
+            else:
+                target_regex = rf"^{block_path}\.({ids})\.attn\.(qkv|proj)$"
+
+        compiled = re.compile(target_regex)
+        matched = []
+        for name, module in self.vision.named_modules():
+            if isinstance(module, nn.Linear) and compiled.match(name):
+                matched.append(name)
+        if not matched:
+            raise RuntimeError(f"no LoRA target linear modules matched regex: {target_regex}")
 
         lora_cfg = LoraConfig(
             r=int(r),
             lora_alpha=int(lora_alpha),
             lora_dropout=float(lora_dropout),
-            target_modules=target_modules,
+            target_modules=target_regex,
             bias="none",
         )
         vision_with_lora = get_peft_model(self.vision, lora_cfg)
@@ -232,7 +223,7 @@ class Qwen3VLBackbone(nn.Module):
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.model.parameters())
         print(
-            f"[LoRA] vision targets={len(target_modules)} selected_blocks={selected_idx} "
+            f"[LoRA] regex={target_regex} matched={len(matched)} selected_blocks={selected_idx} "
             f"trainable={trainable}/{total} ({100.0 * trainable / max(total,1):.4f}%)"
         )
 

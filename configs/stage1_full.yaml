@@ -22,7 +22,7 @@ model:
     lora_alpha: 32
     lora_dropout: 0.05
     lora_last_n_blocks: 4
-    lora_target_keywords: ["q_proj", "k_proj", "v_proj", "o_proj", "qkv", "to_q", "to_k", "to_v", "to_out"]
+    lora_target_regex: ""
     lora_include_mlp: false
     allow_fallback_mock: false
   adapter:
