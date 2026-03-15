@@ -8,7 +8,7 @@ data:
     train: artifacts/manifests/debug_train.jsonl
     val: artifacts/manifests/debug_val.jsonl
     test: artifacts/manifests/debug_test.jsonl
-  image_size: 768
+  image_size: 512
   num_workers: 8
   batch_size: 4
   prefetch_factor: 1
