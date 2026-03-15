@@ -36,25 +36,22 @@ Three experiment presets are provided:
 - `configs/experiments/stage1_exp3_last4_attn_mlp_lora.yaml`
 - `configs/experiments/stage1_exp4_allblocks_attn_mlp_lora.yaml`
 
-Run them in order:
+Run training in order (8-GPU accelerate):
 
 ```bash
-bash scripts/train/run_stage1_exp1_baseline_no_lora.sh
-bash scripts/train/run_stage1_exp2_last4_attn_lora.sh
-bash scripts/train/run_stage1_exp3_last4_attn_mlp_lora.sh
-bash scripts/train/run_stage1_exp4_allblocks_attn_mlp_lora.sh
-```
-
-8-GPU accelerate launch scripts are also provided:
-
-```bash
-export WANDB_API_KEY=your_wandb_api_key
-export WANDB_PROJECT=aigc_stage1_magicbrush
-
 bash scripts/train/run_stage1_exp1_baseline_no_lora_accelerate_8gpu.sh
 bash scripts/train/run_stage1_exp2_last4_attn_lora_accelerate_8gpu.sh
 bash scripts/train/run_stage1_exp3_last4_attn_mlp_lora_accelerate_8gpu.sh
 bash scripts/train/run_stage1_exp4_allblocks_attn_mlp_lora_accelerate_8gpu.sh
+```
+
+Run test/eval separately:
+
+```bash
+bash scripts/test/run_stage1_exp1_baseline_no_lora_test.sh
+bash scripts/test/run_stage1_exp2_last4_attn_lora_test.sh
+bash scripts/test/run_stage1_exp3_last4_attn_mlp_lora_test.sh
+bash scripts/test/run_stage1_exp4_allblocks_attn_mlp_lora_test.sh
 ```
 
 ## Notes

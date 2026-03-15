@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -128,8 +129,8 @@ def main() -> None:
         best_step = int(ckpt.get("best_step", -1))
 
     if use_wandb:
-        wandb_project = train_cfg.get("wandb_project") or "aigc_stage1_stage1"
-        wandb_name = train_cfg.get("wandb_name") or Path(cfg["output_dir"]).name
+        wandb_project = os.environ.get("WANDB_PROJECT") or train_cfg.get("wandb_project") or "aigc_stage1_stage1"
+        wandb_name = os.environ.get("WANDB_NAME") or train_cfg.get("wandb_name") or Path(cfg["output_dir"]).name
         accelerator.init_trackers(
             project_name=wandb_project,
             config=cfg,
