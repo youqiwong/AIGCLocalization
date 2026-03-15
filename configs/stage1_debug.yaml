@@ -1,0 +1,41 @@
+seed: 42
+output_dir: outputs/stage1_debug
+device: cuda
+
+data:
+  data_root: /home/tione/notebook/datasets/MagicBrush/data
+  manifests:
+    train: artifacts/manifests/debug_train.jsonl
+    val: artifacts/manifests/debug_val.jsonl
+    test: artifacts/manifests/debug_test.jsonl
+  image_size: 384
+  num_workers: 4
+  batch_size: 8
+
+model:
+  backbone:
+    name_or_path: /home/tione/notebook/models/modelscope/hub/models/Qwen/Qwen3-VL-8B-Instruct
+    mode: qwen3vl
+    trainable_vision_blocks: 2
+    use_lora: false
+    allow_fallback_mock: true
+  adapter:
+    type: suspicion_gated
+    out_channels: 256
+  proposer:
+    topk_regions: 8
+    region_window: 48
+  decoder:
+    edge_head: false
+
+train:
+  epochs: 5
+  lr: 0.0001
+  weight_decay: 0.01
+  log_every: 20
+  vis_every: 200
+  amp: true
+  resume: ""
+  lambda_det: 1.0
+  lambda_heat: 1.0
+  lambda_mask: 2.0
