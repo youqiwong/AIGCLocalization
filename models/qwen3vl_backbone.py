@@ -77,6 +77,7 @@ class Qwen3VLBackbone(nn.Module):
         lora_dropout: float = 0.05,
         lora_last_n_blocks: int = 4,
         lora_target_regex: Optional[str] = None,
+        lora_all_blocks: bool = False,
         lora_include_mlp: bool = False,
         allow_fallback_mock: bool = True,
     ):
@@ -108,6 +109,7 @@ class Qwen3VLBackbone(nn.Module):
                     lora_dropout=lora_dropout,
                     lora_last_n_blocks=lora_last_n_blocks,
                     lora_target_regex=lora_target_regex,
+                    lora_all_blocks=lora_all_blocks,
                     lora_include_mlp=lora_include_mlp,
                 )
             self.qwen_ok = self.vision is not None
@@ -171,6 +173,7 @@ class Qwen3VLBackbone(nn.Module):
         lora_dropout: float,
         lora_last_n_blocks: int,
         lora_target_regex: Optional[str],
+        lora_all_blocks: bool,
         lora_include_mlp: bool,
     ) -> None:
         if self.vision is None:
@@ -185,20 +188,15 @@ class Qwen3VLBackbone(nn.Module):
             raise RuntimeError("cannot find vision block list; cannot apply LoRA safely")
 
         n = len(blocks)
-        start = max(0, n - int(lora_last_n_blocks))
-        selected_idx = list(range(start, n))
+        selected_idx = self._select_block_indices(num_blocks=n, lora_last_n_blocks=lora_last_n_blocks, lora_all_blocks=lora_all_blocks)
 
         if lora_target_regex:
             target_regex = lora_target_regex
         else:
-            ids = "|".join(str(i) for i in selected_idx)
             if lora_include_mlp:
-                target_regex = (
-                    rf"^{block_path}\.({ids})\."
-                    rf"(attn\.(qkv|proj)|mlp\.(linear_fc1|linear_fc2))$"
-                )
+                target_regex = self._build_block_all_linear_regex(block_path=block_path, selected_idx=selected_idx)
             else:
-                target_regex = rf"^{block_path}\.({ids})\.attn\.(qkv|proj)$"
+                target_regex = self._build_last_n_attn_regex(block_path=block_path, selected_idx=selected_idx)
 
         compiled = re.compile(target_regex)
         matched = []
@@ -225,6 +223,26 @@ class Qwen3VLBackbone(nn.Module):
         print(
             f"[LoRA] regex={target_regex} matched={len(matched)} selected_blocks={selected_idx} "
             f"trainable={trainable}/{total} ({100.0 * trainable / max(total,1):.4f}%)"
+        )
+
+    @staticmethod
+    def _select_block_indices(num_blocks: int, lora_last_n_blocks: int, lora_all_blocks: bool) -> List[int]:
+        if lora_all_blocks:
+            return list(range(num_blocks))
+        start = max(0, num_blocks - int(lora_last_n_blocks))
+        return list(range(start, num_blocks))
+
+    @staticmethod
+    def _build_last_n_attn_regex(block_path: str, selected_idx: List[int]) -> str:
+        ids = "|".join(str(i) for i in selected_idx)
+        return rf"^{block_path}\.({ids})\.attn\.(qkv|proj)$"
+
+    @staticmethod
+    def _build_block_all_linear_regex(block_path: str, selected_idx: List[int]) -> str:
+        ids = "|".join(str(i) for i in selected_idx)
+        return (
+            rf"^{block_path}\.({ids})\."
+            rf"(attn\.(qkv|proj)|mlp\.(linear_fc1|linear_fc2))$"
         )
 
     def _forward_qwen_vision(self, image: torch.Tensor) -> Dict[str, torch.Tensor]:

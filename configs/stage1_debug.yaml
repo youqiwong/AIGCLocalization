@@ -23,6 +23,7 @@ model:
     lora_dropout: 0.05
     lora_last_n_blocks: 4
     lora_target_regex: ""
+    lora_all_blocks: false
     lora_include_mlp: false
     allow_fallback_mock: false
   adapter:

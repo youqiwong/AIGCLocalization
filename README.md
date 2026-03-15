@@ -34,6 +34,7 @@ Three experiment presets are provided:
 - `configs/experiments/stage1_exp1_baseline_no_lora.yaml`
 - `configs/experiments/stage1_exp2_last4_attn_lora.yaml`
 - `configs/experiments/stage1_exp3_last4_attn_mlp_lora.yaml`
+- `configs/experiments/stage1_exp4_allblocks_attn_mlp_lora.yaml`
 
 Run them in order:
 
@@ -41,6 +42,7 @@ Run them in order:
 bash scripts/train/run_stage1_exp1_baseline_no_lora.sh
 bash scripts/train/run_stage1_exp2_last4_attn_lora.sh
 bash scripts/train/run_stage1_exp3_last4_attn_mlp_lora.sh
+bash scripts/train/run_stage1_exp4_allblocks_attn_mlp_lora.sh
 ```
 
 ## Notes

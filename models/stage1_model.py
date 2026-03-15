@@ -24,6 +24,7 @@ class Stage1ForgeryModel(nn.Module):
             lora_dropout=bcfg.get("lora_dropout", 0.05),
             lora_last_n_blocks=bcfg.get("lora_last_n_blocks", 4),
             lora_target_regex=bcfg.get("lora_target_regex", None),
+            lora_all_blocks=bcfg.get("lora_all_blocks", False),
             lora_include_mlp=bcfg.get("lora_include_mlp", False),
             allow_fallback_mock=bcfg.get("allow_fallback_mock", True),
         )

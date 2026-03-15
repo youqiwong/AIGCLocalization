@@ -22,7 +22,8 @@ model:
     lora_alpha: 32
     lora_dropout: 0.05
     lora_last_n_blocks: 4
-    lora_target_regex: "^blocks\\.(23|24|25|26)\\.(attn\\.(qkv|proj)|mlp\\.(linear_fc1|linear_fc2))$"
+    lora_target_regex: ""
+    lora_all_blocks: false
     lora_include_mlp: true
     allow_fallback_mock: false
   adapter:
