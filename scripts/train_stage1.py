@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import DistributedDataParallelKwargs, broadcast_object_list
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -96,14 +96,21 @@ def run_eval(model: torch.nn.Module, loader: DataLoader, accelerator: Accelerato
     return m
 
 
-def make_timestamped_output_dir(base_output_dir: str, resume: str = "") -> Path:
+def make_timestamped_output_dir(base_output_dir: str, accelerator: Accelerator, resume: str = "") -> Path:
     if resume:
         return Path(resume).resolve().parent
-    root = Path(base_output_dir)
-    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = root / ts
-    out_dir.mkdir(parents=True, exist_ok=False)
-    return out_dir
+    out_dir_obj = None
+    if accelerator.is_main_process:
+        root = Path(base_output_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        out_dir_obj = root / ts
+        out_dir_obj.mkdir(parents=True, exist_ok=False)
+    out_dir_list = [str(out_dir_obj) if out_dir_obj is not None else ""]
+    if accelerator.num_processes > 1:
+        broadcast_object_list(out_dir_list)
+    accelerator.wait_for_everyone()
+    return Path(out_dir_list[0])
 
 
 def main() -> None:
@@ -114,18 +121,20 @@ def main() -> None:
     cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
     set_seed(int(cfg.get("seed", 42)))
     train_cfg = cfg["train"]
-    out_dir = make_timestamped_output_dir(cfg["output_dir"], resume=train_cfg.get("resume", ""))
-    cfg["output_dir"] = str(out_dir)
-    with open(out_dir / "resolved_config.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
-    use_wandb = bool(train_cfg.get("use_wandb", True))
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=bool(train_cfg.get("find_unused_parameters", True)))
     accelerator = Accelerator(
         mixed_precision=train_cfg.get("mixed_precision", "bf16"),
         gradient_accumulation_steps=int(train_cfg.get("gradient_accumulation_steps", 1)),
-        log_with=("wandb" if use_wandb else None),
+        log_with=("wandb" if bool(train_cfg.get("use_wandb", True)) else None),
         kwargs_handlers=[ddp_kwargs],
     )
+    out_dir = make_timestamped_output_dir(cfg["output_dir"], accelerator=accelerator, resume=train_cfg.get("resume", ""))
+    cfg["output_dir"] = str(out_dir)
+    if accelerator.is_main_process:
+        with open(out_dir / "resolved_config.yaml", "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+    accelerator.wait_for_everyone()
+    use_wandb = bool(train_cfg.get("use_wandb", True))
     accelerator.print(
         f"[Accelerate] num_processes={accelerator.num_processes} "
         f"device={accelerator.device} mixed_precision={accelerator.mixed_precision}"
