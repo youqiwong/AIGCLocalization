@@ -1,5 +1,5 @@
 seed: 42
-output_dir: outputs/exp3_last4_attn_mlp_lora
+output_dir: /home/tione/notebook/users/youqiwang/AIGCLocalization/outputs/exp3_last4_attn_mlp_lora
 device: cuda
 
 data:

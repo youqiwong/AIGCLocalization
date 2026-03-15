@@ -18,6 +18,19 @@ from utils.metrics import binary_auc_ap, cls_metrics, pixel_metrics
 from utils.vis import save_triplet_vis
 
 
+def resolve_eval_output_dir(base_output_dir: str) -> Path:
+    root = Path(base_output_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"output_dir does not exist: {root}")
+    if (root / "best_by_iou.pt").exists():
+        return root
+    candidates = [p for p in root.iterdir() if p.is_dir() and (p / "best_by_iou.pt").exists()]
+    if not candidates:
+        raise FileNotFoundError(f"no timestamped run directory with best_by_iou.pt found under: {root}")
+    candidates.sort(key=lambda p: p.name)
+    return candidates[-1]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
@@ -27,7 +40,9 @@ def main() -> None:
 
     cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
     device = torch.device(cfg.get("device", "cuda") if torch.cuda.is_available() else "cpu")
-    ckpt_path = args.checkpoint or str(Path(cfg["output_dir"]) / "best_by_iou.pt")
+    run_dir = resolve_eval_output_dir(cfg["output_dir"])
+    cfg["output_dir"] = str(run_dir)
+    ckpt_path = args.checkpoint or str(run_dir / "best_by_iou.pt")
 
     ds = MagicBrushDataset(
         manifest_path=cfg["data"]["manifests"][args.split],

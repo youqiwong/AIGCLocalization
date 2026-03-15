@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import datetime as dt
 import json
 import os
 import random
@@ -95,6 +96,16 @@ def run_eval(model: torch.nn.Module, loader: DataLoader, accelerator: Accelerato
     return m
 
 
+def make_timestamped_output_dir(base_output_dir: str, resume: str = "") -> Path:
+    if resume:
+        return Path(resume).resolve().parent
+    root = Path(base_output_dir)
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = root / ts
+    out_dir.mkdir(parents=True, exist_ok=False)
+    return out_dir
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
@@ -102,10 +113,11 @@ def main() -> None:
 
     cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
     set_seed(int(cfg.get("seed", 42)))
-    out_dir = Path(cfg["output_dir"])
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     train_cfg = cfg["train"]
+    out_dir = make_timestamped_output_dir(cfg["output_dir"], resume=train_cfg.get("resume", ""))
+    cfg["output_dir"] = str(out_dir)
+    with open(out_dir / "resolved_config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
     use_wandb = bool(train_cfg.get("use_wandb", True))
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=bool(train_cfg.get("find_unused_parameters", True)))
     accelerator = Accelerator(

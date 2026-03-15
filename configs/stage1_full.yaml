@@ -1,5 +1,5 @@
 seed: 42
-output_dir: outputs/stage1_full
+output_dir: /home/tione/notebook/users/youqiwang/AIGCLocalization/outputs/stage1_full
 device: cuda
 
 data:

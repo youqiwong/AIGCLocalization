@@ -1,5 +1,5 @@
 seed: 42
-output_dir: outputs/exp1_baseline_no_lora
+output_dir: /home/tione/notebook/users/youqiwang/AIGCLocalization/outputs/exp1_baseline_no_lora
 device: cuda
 
 data:
