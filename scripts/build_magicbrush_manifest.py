@@ -246,13 +246,17 @@ def _build_records_from_file(path: Path, split: str) -> List[Dict[str, Any]]:
     return records
 
 
-def _subsample_debug(records: List[Dict[str, Any]], clean_n: int, edit_n: int, seed: int) -> List[Dict[str, Any]]:
+def _subsample_by_edit_tuples(records: List[Dict[str, Any]], edit_n: int, seed: int) -> List[Dict[str, Any]]:
     rng = random.Random(seed)
-    clean = [r for r in records if r["label"] == 0]
     edit = [r for r in records if r["label"] == 1]
-    if len(clean) < clean_n or len(edit) < edit_n:
-        raise ValueError(f"insufficient samples: clean={len(clean)} edit={len(edit)} need {clean_n}/{edit_n}")
-    return rng.sample(edit, edit_n) + rng.sample(clean, clean_n)
+    clean_map = {r["source_group_id"]: r for r in records if r["label"] == 0}
+    if not edit:
+        raise ValueError("no edited tuples found")
+    actual_edit_n = min(edit_n, len(edit))
+    sampled_edit = rng.sample(edit, actual_edit_n)
+    selected_group_ids = {r["source_group_id"] for r in sampled_edit}
+    sampled_clean = [clean_map[g] for g in selected_group_ids if g in clean_map]
+    return sampled_edit + sampled_clean
 
 
 def main() -> None:
@@ -261,6 +265,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--mode", choices=["debug", "full"], default="debug")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--debug-train-edit-n", type=int, default=8000)
+    parser.add_argument("--debug-val-edit-n", type=int, default=2000)
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
@@ -281,9 +287,10 @@ def main() -> None:
         dev_records.extend(_build_records_from_file(p, split="dev"))
 
     if args.mode == "debug":
-        train_out = _subsample_debug(train_records, clean_n=8000, edit_n=8000, seed=args.seed)
-        val_out = _subsample_debug(dev_records, clean_n=1000, edit_n=1000, seed=args.seed + 1)
-        test_out = _subsample_debug(dev_records, clean_n=2000, edit_n=2000, seed=args.seed + 2)
+        train_out = _subsample_by_edit_tuples(train_records, edit_n=args.debug_train_edit_n, seed=args.seed)
+        val_out = _subsample_by_edit_tuples(dev_records, edit_n=args.debug_val_edit_n, seed=args.seed + 1)
+        # Keep debug_test for compatibility; use the same official dev slice for now.
+        test_out = list(val_out)
         save_jsonl(str(out_dir / "debug_train.jsonl"), train_out)
         save_jsonl(str(out_dir / "debug_val.jsonl"), val_out)
         save_jsonl(str(out_dir / "debug_test.jsonl"), test_out)
@@ -296,6 +303,8 @@ def main() -> None:
         "mode": args.mode,
         "train_total": len(train_records),
         "dev_total": len(dev_records),
+        "debug_train_out": len(train_out) if args.mode == "debug" else None,
+        "debug_val_out": len(val_out) if args.mode == "debug" else None,
     }
     print(json.dumps(stats, indent=2, ensure_ascii=False))
 
