@@ -12,7 +12,7 @@ from torchvision.transforms import functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.stage1_model import Stage1ForgeryModel
-from utils.checkpoint import load_checkpoint
+from utils.checkpoint import load_checkpoint, load_stage1_checkpoint_into_model
 from utils.vis import save_triplet_vis
 
 
@@ -31,19 +31,26 @@ def main() -> None:
 
     model = Stage1ForgeryModel(cfg["model"]).to(device)
     ckpt = load_checkpoint(args.checkpoint, map_location="cpu")
-    model.load_state_dict(ckpt["model"], strict=False)
+    load_stage1_checkpoint_into_model(model, ckpt)
     model.eval()
 
     img = Image.open(args.image).convert("RGB")
     h, w = img.height, img.width
-    img_t = F.to_tensor(img).unsqueeze(0).to(device)  # [1,3,H,W]
+    resized = F.resize(img, [cfg["data"]["image_size"], cfg["data"]["image_size"]], antialias=True)
+    image_vis = F.to_tensor(resized).unsqueeze(0)
+    from transformers import AutoImageProcessor
+
+    image_processor = AutoImageProcessor.from_pretrained(cfg["model"]["backbone"]["name_or_path"], trust_remote_code=True)
+    image_inputs = image_processor(images=resized, do_resize=False, return_tensors="pt")
+    pixel_values = image_inputs["pixel_values"].to(device)
+    image_grid_thw = image_inputs["image_grid_thw"].to(device)
     with torch.no_grad():
-        out = model(img_t)
+        out = model(pixel_values, image_grid_thw, out_hw=image_vis.shape[-2:])
     p_edit = float(out["p_edit"][0].item())
     mask = out["mask0"][0:1].cpu()
     heatmap = out["heatmap"][0:1].cpu()
     save_triplet_vis(
-        image=img_t.cpu(),
+        image=image_vis.cpu(),
         gt_mask=torch.zeros_like(mask),
         heatmap=heatmap,
         pred_mask=mask,

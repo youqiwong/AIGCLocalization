@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aigc_datasets.magicbrush_dataset import MagicBrushDataset, collate_magicbrush_batch
 from models.stage1_model import Stage1ForgeryModel
-from utils.checkpoint import load_checkpoint
+from utils.checkpoint import load_checkpoint, load_stage1_checkpoint_into_model
 from utils.metrics import binary_auc_ap, cls_metrics, pixel_metrics
 from utils.vis import save_triplet_vis
 
@@ -22,9 +22,9 @@ def resolve_eval_output_dir(base_output_dir: str) -> Path:
     root = Path(base_output_dir)
     if not root.exists():
         raise FileNotFoundError(f"output_dir does not exist: {root}")
-    if (root / "best_by_iou.pt").exists():
+    if (root / "best_by_iou.pt").exists() or (root / "best_by_iou_full.pt").exists():
         return root
-    candidates = [p for p in root.iterdir() if p.is_dir() and (p / "best_by_iou.pt").exists()]
+    candidates = [p for p in root.iterdir() if p.is_dir() and ((p / "best_by_iou.pt").exists() or (p / "best_by_iou_full.pt").exists())]
     if not candidates:
         raise FileNotFoundError(f"no timestamped run directory with best_by_iou.pt found under: {root}")
     candidates.sort(key=lambda p: p.name)
@@ -42,7 +42,10 @@ def main() -> None:
     device = torch.device(cfg.get("device", "cuda") if torch.cuda.is_available() else "cpu")
     run_dir = resolve_eval_output_dir(cfg["output_dir"])
     cfg["output_dir"] = str(run_dir)
-    ckpt_path = args.checkpoint or str(run_dir / "best_by_iou.pt")
+    default_ckpt = run_dir / "best_by_iou.pt"
+    if not default_ckpt.exists():
+        default_ckpt = run_dir / "best_by_iou_full.pt"
+    ckpt_path = args.checkpoint or str(default_ckpt)
 
     ds = MagicBrushDataset(
         manifest_path=cfg["data"]["manifests"][args.split],
@@ -64,7 +67,7 @@ def main() -> None:
 
     model = Stage1ForgeryModel(cfg["model"]).to(device)
     ckpt = load_checkpoint(ckpt_path, map_location="cpu")
-    model.load_state_dict(ckpt["model"], strict=False)
+    load_stage1_checkpoint_into_model(model, ckpt)
     model.eval()
 
     probs, labels, pred_masks, gt_masks = [], [], [], []

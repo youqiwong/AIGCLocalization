@@ -248,6 +248,36 @@ class Qwen3VLBackbone(nn.Module):
             rf"(attn\.(qkv|proj)|mlp\.(linear_fc1|linear_fc2))$"
         )
 
+    def has_lora_adapter(self) -> bool:
+        return hasattr(self.vision, "peft_config") and self.vision is not None
+
+    def get_lora_state_dict(self) -> Dict[str, torch.Tensor]:
+        if not self.has_lora_adapter():
+            return {}
+        from peft.utils.save_and_load import get_peft_model_state_dict
+
+        return get_peft_model_state_dict(self.vision, adapter_name="default")
+
+    def load_lora_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
+        if not state_dict:
+            return
+        if not self.has_lora_adapter():
+            raise RuntimeError("cannot load LoRA weights because the backbone vision module is not a PEFT model")
+        from peft.utils.save_and_load import set_peft_model_state_dict
+
+        set_peft_model_state_dict(self.vision, state_dict, adapter_name="default")
+
+    def get_trainable_state_dict(self) -> Dict[str, torch.Tensor]:
+        trainable_names = {name for name, p in self.named_parameters() if p.requires_grad}
+        if not trainable_names:
+            return {}
+        state = self.state_dict()
+        return {name: tensor for name, tensor in state.items() if name in trainable_names}
+
+    def load_trainable_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
+        if state_dict:
+            self.load_state_dict(state_dict, strict=False)
+
     def _tokens_to_feature_map(self, tokens: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
         merge_size = int(getattr(self.vision, "spatial_merge_size", 2))
         split_sizes = (image_grid_thw.prod(-1) // (merge_size**2)).tolist()

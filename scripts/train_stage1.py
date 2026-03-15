@@ -22,7 +22,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from aigc_datasets.magicbrush_dataset import MagicBrushDataset, collate_magicbrush_batch
 from losses import bce_dice_loss, detection_bce_loss, focal_heatmap_loss
 from models.stage1_model import Stage1ForgeryModel
-from utils.checkpoint import load_checkpoint, save_checkpoint
+from utils.checkpoint import (
+    build_full_checkpoint_payload,
+    build_slim_checkpoint_payload,
+    load_checkpoint,
+    save_checkpoint,
+)
 from utils.metrics import binary_auc_ap, cls_metrics, pixel_metrics
 from utils.vis import save_triplet_vis
 
@@ -108,6 +113,7 @@ def run_validation(
     out_dir: Path,
     best_iou: float,
     best_step: int,
+    cfg: Dict,
 ):
     accelerator.wait_for_everyone()
     val_metrics = run_eval(model, val_loader, accelerator=accelerator)
@@ -117,20 +123,61 @@ def run_validation(
     if val_metrics["iou"] > best_iou:
         best_iou = val_metrics["iou"]
         best_step = step
-        if accelerator.is_main_process:
-            save_checkpoint(
-                str(out_dir / "best_by_iou.pt"),
-                {
-                    "model": accelerator.unwrap_model(model).state_dict(),
-                    "optimizer": opt.state_dict(),
-                    "epoch": epoch,
-                    "step": step,
-                    "best_iou": best_iou,
-                    "best_step": best_step,
-                },
-            )
+        save_stage1_checkpoints(
+            tag="best_by_iou",
+            out_dir=out_dir,
+            accelerator=accelerator,
+            model=model,
+            opt=opt,
+            epoch=epoch,
+            step=step,
+            best_iou=best_iou,
+            best_step=best_step,
+            cfg=cfg,
+        )
     model.train()
     return best_iou, best_step
+
+
+def save_stage1_checkpoints(
+    *,
+    tag: str,
+    out_dir: Path,
+    accelerator: Accelerator,
+    model: torch.nn.Module,
+    opt: torch.optim.Optimizer,
+    epoch: int,
+    step: int,
+    best_iou: float,
+    best_step: int,
+    cfg: Dict,
+) -> None:
+    if not accelerator.is_main_process:
+        return
+    unwrapped = accelerator.unwrap_model(model)
+    save_checkpoint(
+        str(out_dir / f"{tag}.pt"),
+        build_slim_checkpoint_payload(
+            model=unwrapped,
+            epoch=epoch,
+            step=step,
+            best_iou=best_iou,
+            best_step=best_step,
+            cfg=cfg,
+        ),
+    )
+    save_checkpoint(
+        str(out_dir / f"{tag}_full.pt"),
+        build_full_checkpoint_payload(
+            model=unwrapped,
+            optimizer=opt,
+            epoch=epoch,
+            step=step,
+            best_iou=best_iou,
+            best_step=best_step,
+            cfg=cfg,
+        ),
+    )
 
 
 def make_timestamped_output_dir(base_output_dir: str, accelerator: Accelerator, resume: str = "") -> Path:
@@ -215,6 +262,8 @@ def main() -> None:
     resume = train_cfg.get("resume", "")
     if resume:
         ckpt = load_checkpoint(resume, map_location="cpu")
+        if "optimizer" not in ckpt:
+            raise ValueError(f"resume checkpoint must be a full training checkpoint, got slim checkpoint: {resume}")
         accelerator.unwrap_model(model).load_state_dict(ckpt["model"], strict=False)
         opt.load_state_dict(ckpt["optimizer"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
@@ -326,6 +375,7 @@ def main() -> None:
                     out_dir=out_dir,
                     best_iou=best_iou,
                     best_step=best_step,
+                    cfg=cfg,
                 )
                 last_eval_step = step
 
@@ -343,20 +393,21 @@ def main() -> None:
                 out_dir=out_dir,
                 best_iou=best_iou,
                 best_step=best_step,
+                cfg=cfg,
             )
         pbar.close()
-        if accelerator.is_main_process:
-            save_checkpoint(
-                str(out_dir / "last.pt"),
-                {
-                    "model": accelerator.unwrap_model(model).state_dict(),
-                    "optimizer": opt.state_dict(),
-                    "epoch": epoch,
-                    "step": step,
-                    "best_iou": best_iou,
-                    "best_step": best_step,
-                },
-            )
+        save_stage1_checkpoints(
+            tag="last",
+            out_dir=out_dir,
+            accelerator=accelerator,
+            model=model,
+            opt=opt,
+            epoch=epoch,
+            step=step,
+            best_iou=best_iou,
+            best_step=best_step,
+            cfg=cfg,
+        )
 
     if use_wandb:
         accelerator.end_training()
