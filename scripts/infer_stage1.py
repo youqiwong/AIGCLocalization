@@ -9,7 +9,7 @@ import yaml
 from PIL import Image
 from torchvision.transforms import functional as F
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.stage1_model import Stage1ForgeryModel
 from utils.checkpoint import load_checkpoint

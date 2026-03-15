@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from datasets.magicbrush_dataset import MagicBrushDataset
 from losses import bce_dice_loss, detection_bce_loss, focal_heatmap_loss

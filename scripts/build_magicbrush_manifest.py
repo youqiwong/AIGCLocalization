@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 import pyarrow.parquet as pq
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from datasets.utils import save_jsonl
 
