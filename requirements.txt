@@ -4,6 +4,7 @@ transformers
 peft
 accelerate
 tqdm
+wandb
 pyarrow
 pillow
 pyyaml

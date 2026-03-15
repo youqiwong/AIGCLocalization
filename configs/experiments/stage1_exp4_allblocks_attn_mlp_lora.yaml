@@ -9,8 +9,8 @@ data:
     val: artifacts/manifests/debug_val.jsonl
     test: artifacts/manifests/debug_test.jsonl
   image_size: 384
-  num_workers: 4
-  batch_size: 8
+  num_workers: 8
+  batch_size: 16
 
 model:
   backbone:
@@ -42,7 +42,11 @@ train:
   log_every: 20
   vis_every: 200
   val_every_steps: 500
-  amp: true
+  mixed_precision: bf16
+  gradient_accumulation_steps: 1
+  use_wandb: true
+  wandb_project: aigc_stage1_magicbrush
+  wandb_name: exp4_allblocks_attn_mlp_lora
   resume: ""
   lambda_det: 1.0
   lambda_heat: 1.0
