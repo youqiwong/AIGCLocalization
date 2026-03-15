@@ -8,9 +8,11 @@ data:
     train: artifacts/manifests/full_train.jsonl
     val: artifacts/manifests/full_val.jsonl
     test: artifacts/manifests/full_test.jsonl
-  image_size: 448
+  image_size: 512
   num_workers: 8
   batch_size: 16
+  prefetch_factor: 1
+  persistent_workers: false
 
 model:
   backbone:
@@ -37,13 +39,18 @@ model:
 
 train:
   epochs: 50
-  lr: 0.00005
+  lr: 0.0001
   weight_decay: 0.01
-  log_every: 20
-  vis_every: 500
+  log_every: 10
+  print_train_log: false
+  vis_every: 50
   val_every_epoch: 1
-  val_every_steps: 500
-  amp: true
+  mixed_precision: bf16
+  gradient_accumulation_steps: 4
+  find_unused_parameters: true
+  use_wandb: true
+  wandb_project: aigc_stage1_magicbrush
+  wandb_name: stage1_full
   resume: ""
   lambda_det: 1.0
   lambda_heat: 1.0
