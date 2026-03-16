@@ -21,7 +21,7 @@ from tqdm.auto import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aigc_datasets.magicbrush_dataset import MagicBrushDataset, collate_magicbrush_batch
-from losses import bce_dice_loss, detection_bce_loss, focal_heatmap_loss
+from losses import bce_dice_loss, detection_bce_loss, edge_bce_loss, focal_heatmap_loss
 from models.stage1_model import Stage1ForgeryModel
 from utils.checkpoint import (
     build_full_checkpoint_payload,
@@ -48,6 +48,7 @@ def build_loader(
     num_workers: int,
     shuffle: bool,
     processor_name_or_path: str,
+    edge_kernel_size: int,
     prefetch_factor: int = 1,
     persistent_workers: bool = True,
 ) -> DataLoader:
@@ -55,6 +56,7 @@ def build_loader(
         manifest_path=manifest,
         image_size=image_size,
         processor_name_or_path=processor_name_or_path,
+        edge_kernel_size=edge_kernel_size,
     )
     loader_kwargs = dict(
         dataset=ds,
@@ -291,9 +293,19 @@ def _emit_step_debug_snapshot(
         _emit_debug_message(out_dir, accelerator, line)
 
 
-def run_eval(model: torch.nn.Module, loader: DataLoader, accelerator: Accelerator) -> Dict[str, float]:
+def run_eval(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    accelerator: Accelerator,
+    train_cfg: Dict[str, Any],
+    vis_path: Optional[str] = None,
+) -> Dict[str, float]:
     model.eval()
     all_prob, all_label, all_pred_mask, all_gt_mask = [], [], [], []
+    use_edge_loss = bool(train_cfg.get("use_edge_loss", True))
+    loss_sums = {"loss": 0.0, "l_det": 0.0, "l_heat": 0.0, "l_mask": 0.0, "l_edge": 0.0}
+    total_items = 0
+    vis_saved = False
     with torch.no_grad():
         vbar = tqdm(loader, desc="Val", leave=False, disable=not accelerator.is_local_main_process, dynamic_ncols=True, mininterval=0.0)
         for batch in vbar:
@@ -302,16 +314,55 @@ def run_eval(model: torch.nn.Module, loader: DataLoader, accelerator: Accelerato
             image_grid_thw = batch["image_grid_thw"]
             label = batch["label"]
             mask = batch["mask"]
+            edge_gt = batch["edge_gt"]
             out = model(pixel_values, image_grid_thw, out_hw=mask.shape[-2:])
+            heat_target = F.interpolate(mask, size=out["heatmap"].shape[-2:], mode="nearest")
+
+            l_det = detection_bce_loss(out["p_edit"], label)
+            l_heat = focal_heatmap_loss(out["heatmap"], heat_target)
+            l_mask = bce_dice_loss(out["mask0"], mask)
+            if use_edge_loss and "edge0" in out:
+                l_edge = edge_bce_loss(out["edge0"], edge_gt)
+            else:
+                l_edge = torch.zeros_like(l_det)
+            loss = (
+                float(train_cfg["lambda_det"]) * l_det
+                + float(train_cfg["lambda_heat"]) * l_heat
+                + float(train_cfg["lambda_mask"]) * l_mask
+                + float(train_cfg.get("lambda_edge", 0.1)) * l_edge
+            )
 
             prob = accelerator.gather_for_metrics(out["p_edit"].detach())
             lab = accelerator.gather_for_metrics(label.detach())
             pred = accelerator.gather_for_metrics(out["mask0"].detach())
             gt = accelerator.gather_for_metrics(mask.detach())
+            batch_items = torch.tensor([label.shape[0]], device=label.device, dtype=torch.float32)
+            gathered_items = accelerator.gather_for_metrics(batch_items)
             all_prob.append(prob.cpu())
             all_label.append(lab.cpu())
             all_pred_mask.append(pred.cpu())
             all_gt_mask.append(gt.cpu())
+            total_items += int(gathered_items.sum().item())
+            for name, tensor in {
+                "loss": loss,
+                "l_det": l_det,
+                "l_heat": l_heat,
+                "l_mask": l_mask,
+                "l_edge": l_edge,
+            }.items():
+                gathered = accelerator.gather_for_metrics((tensor.detach() * batch_items).view(1))
+                loss_sums[name] += float(gathered.sum().item())
+            if vis_path and not vis_saved and accelerator.is_main_process:
+                save_triplet_vis(
+                    image=image.detach().float().cpu(),
+                    gt_mask=mask.detach().float().cpu(),
+                    heatmap=out["heatmap"].detach().float().cpu(),
+                    pred_mask=out["mask0"].detach().float().cpu(),
+                    gt_edge=edge_gt.detach().float().cpu(),
+                    pred_edge=(torch.sigmoid(out["edge0"]).detach().float().cpu() if "edge0" in out else None),
+                    path=vis_path,
+                )
+                vis_saved = True
 
     prob = torch.cat(all_prob, dim=0)
     label = torch.cat(all_label, dim=0)
@@ -321,6 +372,8 @@ def run_eval(model: torch.nn.Module, loader: DataLoader, accelerator: Accelerato
     m.update(binary_auc_ap(prob, label))
     m.update(cls_metrics(prob, label))
     m.update(pixel_metrics(pred_mask, gt_mask))
+    if total_items > 0:
+        m.update({name: loss_sums[name] / float(total_items) for name in loss_sums})
     return m
 
 
@@ -329,6 +382,7 @@ def run_validation(
     epoch: int,
     step: int,
     optimizer_step: int,
+    train_cfg: Dict[str, Any],
     model: torch.nn.Module,
     opt: torch.optim.Optimizer,
     val_loader: DataLoader,
@@ -340,7 +394,13 @@ def run_validation(
     cfg: Dict,
 ):
     accelerator.wait_for_everyone()
-    val_metrics = run_eval(model, val_loader, accelerator=accelerator)
+    val_metrics = run_eval(
+        model,
+        val_loader,
+        accelerator=accelerator,
+        train_cfg=train_cfg,
+        vis_path=str(out_dir / "vis" / f"val_step{step}.png"),
+    )
     accelerator.print(json.dumps({"epoch": epoch, "step": step, "val": val_metrics}, ensure_ascii=False))
     if use_wandb:
         accelerator.log({f"val/{k}": float(v) for k, v in val_metrics.items()}, step=step)
@@ -459,6 +519,7 @@ def main() -> None:
         num_workers=cfg["data"]["num_workers"],
         shuffle=True,
         processor_name_or_path=cfg["model"]["backbone"]["name_or_path"],
+        edge_kernel_size=int(train_cfg.get("edge_kernel_size", 5)),
         prefetch_factor=int(cfg["data"].get("prefetch_factor", 1)),
         persistent_workers=bool(cfg["data"].get("persistent_workers", True)),
     )
@@ -469,11 +530,19 @@ def main() -> None:
         num_workers=cfg["data"]["num_workers"],
         shuffle=False,
         processor_name_or_path=cfg["model"]["backbone"]["name_or_path"],
+        edge_kernel_size=int(train_cfg.get("edge_kernel_size", 5)),
         prefetch_factor=int(cfg["data"].get("prefetch_factor", 1)),
         persistent_workers=bool(cfg["data"].get("persistent_workers", True)),
     )
 
     model = Stage1ForgeryModel(cfg["model"])
+    resume = train_cfg.get("resume", "")
+    init_from_checkpoint = train_cfg.get("init_from_checkpoint", "")
+    if resume and init_from_checkpoint:
+        raise ValueError("train.resume and train.init_from_checkpoint are mutually exclusive")
+    if init_from_checkpoint:
+        init_ckpt = load_checkpoint(init_from_checkpoint, map_location="cpu")
+        load_stage1_checkpoint_into_model(model, init_ckpt)
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=float(train_cfg["lr"]),
@@ -496,13 +565,18 @@ def main() -> None:
     best_step = -1
     val_every_steps = int(train_cfg.get("val_every_steps", 0))
     val_every_epoch = int(train_cfg.get("val_every_epoch", 0))
-    resume = train_cfg.get("resume", "")
     if resume:
         ckpt = load_checkpoint(resume, map_location="cpu")
         if "optimizer" not in ckpt:
             raise ValueError(f"resume checkpoint must be a full training checkpoint, got slim checkpoint: {resume}")
         load_stage1_checkpoint_into_model(accelerator.unwrap_model(model), ckpt)
-        opt.load_state_dict(ckpt["optimizer"])
+        try:
+            opt.load_state_dict(ckpt["optimizer"])
+        except ValueError as exc:
+            raise ValueError(
+                "resume checkpoint optimizer state is incompatible with the current model. "
+                "For adding a new edge head, use train.init_from_checkpoint to load only model weights."
+            ) from exc
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         step = int(ckpt.get("step", 0))
         optimizer_step = int(ckpt.get("optimizer_step", step // max(1, grad_accum_steps)))
@@ -521,6 +595,8 @@ def main() -> None:
         f"total_optimizer_steps={total_optimizer_steps} grad_accumulation_steps={grad_accum_steps} "
         f"start_lr={_get_current_lr(opt):.6g}"
     )
+    if init_from_checkpoint:
+        accelerator.print(f"[Init] loaded model weights with strict=False from {init_from_checkpoint}")
 
     if use_wandb:
         wandb_project = os.environ.get("WANDB_PROJECT") or train_cfg.get("wandb_project") or "aigc_stage1_stage1"
@@ -533,6 +609,7 @@ def main() -> None:
 
     debug_numeric_checks = bool(train_cfg.get("debug_numeric_checks", True))
     max_grad_norm = float(train_cfg.get("max_grad_norm", 1.0))
+    use_edge_loss = bool(train_cfg.get("use_edge_loss", True))
     numeric_hook_handles = []
     if debug_numeric_checks:
         numeric_hook_handles = _register_numeric_forward_hooks(accelerator.unwrap_model(model))
@@ -553,11 +630,13 @@ def main() -> None:
             image = None
             label = None
             gt_mask = None
+            edge_gt = None
             out = None
             heat_target = None
             l_det = None
             l_heat = None
             l_mask = None
+            l_edge = None
             loss = None
             grad_norm = None
             applied_lr = _get_current_lr(opt)
@@ -568,6 +647,7 @@ def main() -> None:
                     image_grid_thw = batch["image_grid_thw"]
                     label = batch["label"]
                     gt_mask = batch["mask"]
+                    edge_gt = batch["edge_gt"]
                     out = model(pixel_values, image_grid_thw, out_hw=gt_mask.shape[-2:])
                     heat_target = F.interpolate(gt_mask, size=out["heatmap"].shape[-2:], mode="nearest")
 
@@ -591,6 +671,14 @@ def main() -> None:
                         _ensure_probability_tensor(
                             name="heat_target",
                             tensor=heat_target,
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+                        _ensure_finite(
+                            name="edge_gt",
+                            tensor=edge_gt,
                             accelerator=accelerator,
                             epoch=epoch,
                             step=step,
@@ -620,14 +708,28 @@ def main() -> None:
                             step=step,
                             out_dir=out_dir,
                         )
+                        if use_edge_loss and "edge0" in out:
+                            _ensure_finite(
+                                name="out.edge0",
+                                tensor=out["edge0"],
+                                accelerator=accelerator,
+                                epoch=epoch,
+                                step=step,
+                                out_dir=out_dir,
+                            )
 
                     l_det = detection_bce_loss(out["p_edit"], label)
                     l_heat = focal_heatmap_loss(out["heatmap"], heat_target)
                     l_mask = bce_dice_loss(out["mask0"], gt_mask)
+                    if use_edge_loss and "edge0" in out:
+                        l_edge = edge_bce_loss(out["edge0"], edge_gt)
+                    else:
+                        l_edge = torch.zeros_like(l_det)
                     loss = (
                         float(train_cfg["lambda_det"]) * l_det
                         + float(train_cfg["lambda_heat"]) * l_heat
                         + float(train_cfg["lambda_mask"]) * l_mask
+                        + float(train_cfg.get("lambda_edge", 0.1)) * l_edge
                     )
 
                     if debug_numeric_checks:
@@ -650,6 +752,14 @@ def main() -> None:
                         _ensure_finite(
                             name="loss/mask",
                             tensor=l_mask,
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+                        _ensure_finite(
+                            name="loss/edge",
+                            tensor=l_edge,
                             accelerator=accelerator,
                             epoch=epoch,
                             step=step,
@@ -728,13 +838,16 @@ def main() -> None:
                         values={
                             "label": label,
                             "gt_mask": gt_mask,
+                            "edge_gt": edge_gt,
                             "heat_target": heat_target,
                             "out.p_edit": None if out is None else out.get("p_edit"),
                             "out.heatmap": None if out is None else out.get("heatmap"),
                             "out.mask0": None if out is None else out.get("mask0"),
+                            "out.edge0": None if out is None else out.get("edge0"),
                             "loss/det": l_det,
                             "loss/heat": l_heat,
                             "loss/mask": l_mask,
+                            "loss/edge": l_edge,
                             "loss/total": loss,
                         },
                         extra_lines=extra_lines + [f"exception={type(exc).__name__}: {exc}"],
@@ -751,6 +864,7 @@ def main() -> None:
                     det=f"{float(l_det.item()):.4f}",
                     heat=f"{float(l_heat.item()):.4f}",
                     mask=f"{float(l_mask.item()):.4f}",
+                    edge=f"{float(l_edge.item()):.4f}",
                     lr=f"{current_lr:.2e}",
                     step=step,
                     refresh=True,
@@ -767,6 +881,7 @@ def main() -> None:
                                 "l_det": float(l_det.item()),
                                 "l_heat": float(l_heat.item()),
                                 "l_mask": float(l_mask.item()),
+                                "l_edge": float(l_edge.item()),
                             }
                         )
                     )
@@ -777,6 +892,7 @@ def main() -> None:
                             "train/l_det": float(l_det.item()),
                             "train/l_heat": float(l_heat.item()),
                             "train/l_mask": float(l_mask.item()),
+                            "train/l_edge": float(l_edge.item()),
                             "train/lr": current_lr,
                             "epoch": epoch,
                         },
@@ -791,6 +907,8 @@ def main() -> None:
                     gt_mask=gt_mask[:nvis].detach().float().cpu(),
                     heatmap=out["heatmap"][:nvis].detach().float().cpu(),
                     pred_mask=out["mask0"][:nvis].detach().float().cpu(),
+                    gt_edge=edge_gt[:nvis].detach().float().cpu(),
+                    pred_edge=(torch.sigmoid(out["edge0"][:nvis]).detach().float().cpu() if "edge0" in out else None),
                     path=str(out_dir / "vis" / f"train_step{step}.png"),
                 )
 
@@ -799,6 +917,7 @@ def main() -> None:
                     epoch=epoch,
                     step=step,
                     optimizer_step=optimizer_step,
+                    train_cfg=train_cfg,
                     model=model,
                     opt=opt,
                     val_loader=val_loader,
@@ -818,6 +937,7 @@ def main() -> None:
                 epoch=epoch,
                 step=step,
                 optimizer_step=optimizer_step,
+                train_cfg=train_cfg,
                 model=model,
                 opt=opt,
                 val_loader=val_loader,

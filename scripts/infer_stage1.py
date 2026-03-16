@@ -49,11 +49,13 @@ def main() -> None:
     p_edit = float(out["p_edit"][0].item())
     mask = out["mask0"][0:1].cpu()
     heatmap = out["heatmap"][0:1].cpu()
+    pred_edge = torch.sigmoid(out["edge0"][0:1]).cpu() if "edge0" in out else None
     save_triplet_vis(
         image=image_vis.cpu(),
         gt_mask=torch.zeros_like(mask),
         heatmap=heatmap,
         pred_mask=mask,
+        pred_edge=pred_edge,
         path=str(out_dir / "prediction.png"),
         max_items=1,
     )

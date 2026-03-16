@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aigc_datasets.magicbrush_dataset import MagicBrushDataset, collate_magicbrush_batch
+from losses import bce_dice_loss, detection_bce_loss, edge_bce_loss, focal_heatmap_loss
 from models.stage1_model import Stage1ForgeryModel
 from utils.checkpoint import load_checkpoint, load_stage1_checkpoint_into_model
 from utils.metrics import binary_auc_ap, cls_metrics, pixel_metrics
@@ -51,6 +52,7 @@ def main() -> None:
         manifest_path=cfg["data"]["manifests"][args.split],
         image_size=cfg["data"]["image_size"],
         processor_name_or_path=cfg["model"]["backbone"]["name_or_path"],
+        edge_kernel_size=int(cfg["train"].get("edge_kernel_size", 5)),
     )
     loader_kwargs = dict(
         dataset=ds,
@@ -71,6 +73,9 @@ def main() -> None:
     model.eval()
 
     probs, labels, pred_masks, gt_masks = [], [], [], []
+    loss_sums = {"loss": 0.0, "l_det": 0.0, "l_heat": 0.0, "l_mask": 0.0, "l_edge": 0.0}
+    total_items = 0
+    use_edge_loss = bool(cfg["train"].get("use_edge_loss", True))
     vis_saved = False
     with torch.no_grad():
         for batch in tqdm(loader, desc=f"Eval-{args.split}"):
@@ -79,17 +84,41 @@ def main() -> None:
             image_grid_thw = batch["image_grid_thw"].to(device)
             label = batch["label"].to(device)
             mask = batch["mask"].to(device)
+            edge_gt = batch["edge_gt"].to(device)
             out = model(pixel_values, image_grid_thw, out_hw=mask.shape[-2:])
+            heat_target = torch.nn.functional.interpolate(mask, size=out["heatmap"].shape[-2:], mode="nearest")
+            l_det = detection_bce_loss(out["p_edit"], label)
+            l_heat = focal_heatmap_loss(out["heatmap"], heat_target)
+            l_mask = bce_dice_loss(out["mask0"], mask)
+            if use_edge_loss and "edge0" in out:
+                l_edge = edge_bce_loss(out["edge0"], edge_gt)
+            else:
+                l_edge = torch.zeros_like(l_det)
+            loss = (
+                float(cfg["train"]["lambda_det"]) * l_det
+                + float(cfg["train"]["lambda_heat"]) * l_heat
+                + float(cfg["train"]["lambda_mask"]) * l_mask
+                + float(cfg["train"].get("lambda_edge", 0.1)) * l_edge
+            )
             probs.append(out["p_edit"].cpu())
             labels.append(label.cpu())
             pred_masks.append(out["mask0"].cpu())
             gt_masks.append(mask.cpu())
+            batch_items = label.shape[0]
+            total_items += batch_items
+            loss_sums["loss"] += float(loss.item()) * batch_items
+            loss_sums["l_det"] += float(l_det.item()) * batch_items
+            loss_sums["l_heat"] += float(l_heat.item()) * batch_items
+            loss_sums["l_mask"] += float(l_mask.item()) * batch_items
+            loss_sums["l_edge"] += float(l_edge.item()) * batch_items
             if not vis_saved:
                 save_triplet_vis(
                     image.cpu(),
                     gt_mask=mask.cpu(),
                     heatmap=out["heatmap"].cpu(),
                     pred_mask=out["mask0"].cpu(),
+                    gt_edge=edge_gt.cpu(),
+                    pred_edge=(torch.sigmoid(out["edge0"]).cpu() if "edge0" in out else None),
                     path=str(Path(cfg["output_dir"]) / f"{args.split}_vis.png"),
                 )
                 vis_saved = True
@@ -103,6 +132,8 @@ def main() -> None:
     metrics.update(binary_auc_ap(prob, label))
     metrics.update(cls_metrics(prob, label))
     metrics.update(pixel_metrics(pred_mask, gt_mask))
+    if total_items > 0:
+        metrics.update({name: loss_sums[name] / float(total_items) for name in loss_sums})
     print(json.dumps({args.split: metrics}, indent=2, ensure_ascii=False))
 
 

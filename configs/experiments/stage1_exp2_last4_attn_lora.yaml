@@ -35,7 +35,7 @@ model:
     topk_regions: 8
     region_window: 48
   decoder:
-    edge_head: false
+    edge_head: true
 
 train:
   epochs: 50
@@ -56,6 +56,10 @@ train:
   wandb_project: aigc_stage1_magicbrush
   wandb_name: exp2_last4_attn_lora
   resume: ""
+  init_from_checkpoint: ""
+  use_edge_loss: true
+  edge_kernel_size: 5
   lambda_det: 1.0
   lambda_heat: 1.0
   lambda_mask: 2.0
+  lambda_edge: 0.1

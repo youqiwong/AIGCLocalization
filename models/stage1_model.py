@@ -46,10 +46,13 @@ class Stage1ForgeryModel(nn.Module):
         prop = self.proposer(pyr)
         dec = self.decoder(pyr, prop["heatmap"], out_hw=out_hw)
         regions = build_candidate_regions(prop["heatmap"], topk=self.topk_regions, window=self.region_window)
-        return {
+        out = {
             "p_edit": prop["p_edit"],  # [B]
             "heatmap": prop["heatmap"],  # [B,1,h,w]
             "mask0": dec["mask0"],  # [B,1,H,W]
             "candidate_regions": regions,  # List[[K,4]]
             "features": pyr,
         }
+        if "edge0" in dec:
+            out["edge0"] = dec["edge0"]  # [B,1,H,W] logits
+        return out

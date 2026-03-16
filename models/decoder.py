@@ -5,10 +5,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class EdgeHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 128):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, 1, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
 class HeatmapGuidedDecoder(nn.Module):
     def __init__(self, channels: int = 256, edge_head: bool = False):
         super().__init__()
-        self.edge_head = edge_head
+        self.use_edge_head = edge_head
         self.fuse = nn.Sequential(
             nn.Conv2d(channels * 4 + 4, channels, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -16,7 +33,7 @@ class HeatmapGuidedDecoder(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.mask_head = nn.Conv2d(channels // 2, 1, 1)
-        self.edge_conv = nn.Conv2d(channels // 2, 1, 1) if edge_head else None
+        self.edge_head = EdgeHead(channels // 2, mid_channels=max(128, channels // 2)) if edge_head else None
 
     def _guided_cat(self, feat: torch.Tensor, heatmap: torch.Tensor, tgt_size) -> torch.Tensor:
         f = F.interpolate(feat, size=tgt_size, mode="bilinear", align_corners=False)
@@ -39,6 +56,6 @@ class HeatmapGuidedDecoder(nn.Module):
         mask_low = torch.sigmoid(self.mask_head(x))  # [B,1,h,w]
         mask0 = F.interpolate(mask_low, size=out_hw, mode="bilinear", align_corners=False)  # [B,1,H,W]
         out = {"mask0": mask0}
-        if self.edge_conv is not None:
-            out["edge"] = torch.sigmoid(F.interpolate(self.edge_conv(x), size=out_hw, mode="bilinear", align_corners=False))
+        if self.edge_head is not None:
+            out["edge0"] = F.interpolate(self.edge_head(x), size=out_hw, mode="bilinear", align_corners=False)
         return out
