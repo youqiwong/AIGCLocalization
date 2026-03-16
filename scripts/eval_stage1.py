@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import torch
+import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -22,6 +23,23 @@ from utils.metrics import binary_auc_ap, cls_metrics, pixel_metrics
 from utils.vis import save_eval_annotated_vis
 
 
+class EvalStage1Wrapper(nn.Module):
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor, out_hw):
+        out = self.model(pixel_values, image_grid_thw, out_hw=out_hw)
+        result = {
+            "p_edit": out["p_edit"],
+            "heatmap": out["heatmap"],
+            "mask0": out["mask0"],
+        }
+        if "edge0" in out:
+            result["edge0"] = out["edge0"]
+        return result
+
+
 def resolve_eval_output_dir(base_output_dir: str) -> Path:
     root = Path(base_output_dir)
     if not root.exists():
@@ -35,10 +53,10 @@ def resolve_eval_output_dir(base_output_dir: str) -> Path:
     return candidates[-1]
 
 
-def build_loader(dataset, cfg: Dict[str, Any]) -> DataLoader:
+def build_loader(dataset, cfg: Dict[str, Any], batch_size: int) -> DataLoader:
     loader_kwargs = dict(
         dataset=dataset,
-        batch_size=cfg["data"]["batch_size"],
+        batch_size=batch_size,
         shuffle=False,
         num_workers=cfg["data"]["num_workers"],
         pin_memory=True,
@@ -56,6 +74,7 @@ def evaluate_loader(
     loader: DataLoader,
     model: torch.nn.Module,
     device: torch.device,
+    num_gpus: int,
     cfg: Dict[str, Any],
     vis_path: str,
     max_vis_items: int,
@@ -66,6 +85,19 @@ def evaluate_loader(
     total_items = 0
     use_edge_loss = bool(cfg["train"].get("use_edge_loss", True))
     vis_saved = False
+    print(
+        json.dumps(
+            {
+                "dataset": dataset_name,
+                "num_samples": len(loader.dataset),
+                "num_batches": len(loader),
+                "total_batch_size": loader.batch_size,
+                "num_gpus": num_gpus,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
     with torch.no_grad():
         for batch in tqdm(loader, desc=f"Eval-{dataset_name}", dynamic_ncols=True):
@@ -216,6 +248,8 @@ def main() -> None:
     parser.add_argument("--split", type=str, choices=["val", "test"], default="test")
     parser.add_argument("--vis-path", type=str, default="")
     parser.add_argument("--max-vis-items", type=int, default=5)
+    parser.add_argument("--num-gpus", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=0)
     parser.add_argument("--eval-all-datasets", action="store_true")
     parser.add_argument(
         "--autosplice-txt",
@@ -242,7 +276,12 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
-    device = torch.device(cfg.get("device", "cuda") if torch.cuda.is_available() else "cpu")
+    requested_num_gpus = max(1, int(args.num_gpus))
+    available_num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if requested_num_gpus > 1 and available_num_gpus < requested_num_gpus:
+        raise ValueError(f"requested {requested_num_gpus} GPUs, but only {available_num_gpus} are available")
+    device = torch.device("cuda:0" if available_num_gpus > 0 else "cpu")
+    eval_batch_size = int(args.batch_size) if int(args.batch_size) > 0 else int(cfg["data"]["batch_size"])
     run_dir = Path(args.checkpoint).resolve().parent if args.checkpoint else resolve_eval_output_dir(cfg["output_dir"])
     cfg["output_dir"] = str(run_dir)
     default_ckpt = run_dir / "best_by_iou.pt"
@@ -250,9 +289,12 @@ def main() -> None:
         default_ckpt = run_dir / "best_by_iou_full.pt"
     ckpt_path = args.checkpoint or str(default_ckpt)
 
-    model = Stage1ForgeryModel(cfg["model"]).to(device)
+    base_model = Stage1ForgeryModel(cfg["model"]).to(device)
     ckpt = load_checkpoint(ckpt_path, map_location="cpu")
-    load_stage1_checkpoint_into_model(model, ckpt)
+    load_stage1_checkpoint_into_model(base_model, ckpt)
+    model = EvalStage1Wrapper(base_model).to(device)
+    if available_num_gpus > 1 and requested_num_gpus > 1:
+        model = nn.DataParallel(model, device_ids=list(range(requested_num_gpus)))
     model.eval()
 
     if args.eval_all_datasets:
@@ -284,13 +326,14 @@ def main() -> None:
 
         results: List[Dict[str, Any]] = []
         for dataset_name, dataset in dataset_specs:
-            loader = build_loader(dataset, cfg)
+            loader = build_loader(dataset, cfg, batch_size=eval_batch_size)
             vis_path = str(run_dir / f"{dataset_name.replace('-', '_').replace(' ', '_')}_vis_annotated.png")
             result = evaluate_loader(
                 dataset_name=dataset_name,
                 loader=loader,
                 model=model,
                 device=device,
+                num_gpus=requested_num_gpus if available_num_gpus > 0 else 0,
                 cfg=cfg,
                 vis_path=vis_path,
                 max_vis_items=args.max_vis_items,
@@ -316,13 +359,14 @@ def main() -> None:
         return
 
     dataset = build_magicbrush_dataset(cfg, args.split)
-    loader = build_loader(dataset, cfg)
+    loader = build_loader(dataset, cfg, batch_size=eval_batch_size)
     vis_path = args.vis_path or str(run_dir / f"{args.split}_vis_annotated.png")
     result = evaluate_loader(
         dataset_name=f"MagicBrush-{args.split}",
         loader=loader,
         model=model,
         device=device,
+        num_gpus=requested_num_gpus if available_num_gpus > 0 else 0,
         cfg=cfg,
         vis_path=vis_path,
         max_vis_items=args.max_vis_items,
