@@ -6,7 +6,7 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -67,6 +67,194 @@ def build_loader(
         loader_kwargs["prefetch_factor"] = prefetch_factor
         loader_kwargs["persistent_workers"] = persistent_workers
     return DataLoader(**loader_kwargs)
+
+
+def _iter_named_tensors(obj: Any, prefix: str) -> Iterable[Tuple[str, torch.Tensor]]:
+    if torch.is_tensor(obj):
+        yield prefix, obj
+        return
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            yield from _iter_named_tensors(value, child_prefix)
+        return
+    if isinstance(obj, (list, tuple)):
+        for idx, value in enumerate(obj):
+            child_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            yield from _iter_named_tensors(value, child_prefix)
+
+
+def _tensor_stats(tensor: torch.Tensor) -> Dict[str, Any]:
+    flat = tensor.detach().float()
+    finite = torch.isfinite(flat)
+    stats = {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "nan_count": int(torch.isnan(flat).sum().item()),
+        "inf_count": int(torch.isinf(flat).sum().item()),
+    }
+    if finite.any():
+        valid = flat[finite]
+        stats["min"] = float(valid.min().item())
+        stats["max"] = float(valid.max().item())
+        stats["mean"] = float(valid.mean().item())
+    else:
+        stats["min"] = None
+        stats["max"] = None
+        stats["mean"] = None
+    return stats
+
+
+def _format_tensor_stats(name: str, tensor: torch.Tensor) -> str:
+    stats = _tensor_stats(tensor)
+    return (
+        f"{name}: shape={stats['shape']} dtype={stats['dtype']} device={stats['device']} "
+        f"min={stats['min']} max={stats['max']} mean={stats['mean']} "
+        f"nan={stats['nan_count']} inf={stats['inf_count']}"
+    )
+
+
+def _rank_prefix(accelerator: Accelerator) -> str:
+    return f"[rank{accelerator.process_index}]"
+
+
+def _append_debug_line(out_dir: Path, accelerator: Accelerator, message: str) -> None:
+    debug_path = out_dir / f"numeric_debug_rank{accelerator.process_index}.log"
+    with open(debug_path, "a", encoding="utf-8") as f:
+        f.write(message.rstrip() + "\n")
+
+
+def _emit_debug_message(out_dir: Path, accelerator: Accelerator, message: str) -> None:
+    line = f"{_rank_prefix(accelerator)} {message}"
+    print(line, flush=True)
+    _append_debug_line(out_dir, accelerator, line)
+
+
+def _raise_numeric_error(
+    *,
+    name: str,
+    tensor: torch.Tensor,
+    accelerator: Accelerator,
+    epoch: int,
+    step: int,
+    out_dir: Path,
+    reason: str,
+) -> None:
+    message = f"{reason} at epoch={epoch} step={step} {name}; {_format_tensor_stats(name, tensor)}"
+    _emit_debug_message(out_dir, accelerator, message)
+    raise FloatingPointError(message)
+
+
+def _ensure_finite(
+    *,
+    name: str,
+    tensor: torch.Tensor,
+    accelerator: Accelerator,
+    epoch: int,
+    step: int,
+    out_dir: Path,
+) -> None:
+    if not torch.isfinite(tensor.detach().float()).all():
+        _raise_numeric_error(
+            name=name,
+            tensor=tensor,
+            accelerator=accelerator,
+            epoch=epoch,
+            step=step,
+            out_dir=out_dir,
+            reason="Non-finite tensor detected",
+        )
+
+
+def _ensure_probability_tensor(
+    *,
+    name: str,
+    tensor: torch.Tensor,
+    accelerator: Accelerator,
+    epoch: int,
+    step: int,
+    out_dir: Path,
+    atol: float = 1e-4,
+) -> None:
+    _ensure_finite(name=name, tensor=tensor, accelerator=accelerator, epoch=epoch, step=step, out_dir=out_dir)
+    view = tensor.detach().float()
+    min_val = float(view.min().item())
+    max_val = float(view.max().item())
+    if min_val < -atol or max_val > 1.0 + atol:
+        _raise_numeric_error(
+            name=name,
+            tensor=tensor,
+            accelerator=accelerator,
+            epoch=epoch,
+            step=step,
+            out_dir=out_dir,
+            reason="BCE probability tensor out of [0, 1] range",
+        )
+
+
+def _collect_nonfinite_named_values(named_tensors: Iterable[Tuple[str, torch.Tensor]], limit: int = 8) -> List[str]:
+    bad = []
+    for name, tensor in named_tensors:
+        if not torch.isfinite(tensor.detach().float()).all():
+            bad.append(_format_tensor_stats(name, tensor))
+            if len(bad) >= limit:
+                break
+    return bad
+
+
+def _collect_nonfinite_gradients(model: torch.nn.Module, limit: int = 8) -> List[str]:
+    return _collect_nonfinite_named_values(
+        ((f"grad:{name}", param.grad) for name, param in model.named_parameters() if param.grad is not None),
+        limit=limit,
+    )
+
+
+def _collect_nonfinite_trainable_params(model: torch.nn.Module, limit: int = 8) -> List[str]:
+    return _collect_nonfinite_named_values(
+        ((f"param:{name}", param) for name, param in model.named_parameters() if param.requires_grad),
+        limit=limit,
+    )
+
+
+def _register_numeric_forward_hooks(model: torch.nn.Module):
+    handles = []
+    for module_name, module in model.named_modules():
+        has_direct_trainable_params = any(param.requires_grad for param in module.parameters(recurse=False))
+        is_stage1_top = module_name in {"backbone", "adapter", "proposer", "decoder"}
+        if not has_direct_trainable_params and not is_stage1_top:
+            continue
+
+        def _hook(_module, _inputs, output, name=module_name):
+            for tensor_name, tensor in _iter_named_tensors(output, prefix="output"):
+                if not torch.isfinite(tensor.detach().float()).all():
+                    raise FloatingPointError(
+                        f"Non-finite forward output in module '{name or '<root>'}' "
+                        f"({type(_module).__name__}) at {tensor_name}; {_format_tensor_stats(tensor_name, tensor)}"
+                    )
+
+        handles.append(module.register_forward_hook(_hook))
+    return handles
+
+
+def _emit_step_debug_snapshot(
+    *,
+    accelerator: Accelerator,
+    out_dir: Path,
+    epoch: int,
+    step: int,
+    values: Dict[str, Optional[torch.Tensor]],
+    extra_lines: Optional[List[str]] = None,
+) -> None:
+    lines = [f"numeric debug snapshot epoch={epoch} step={step}"]
+    for name, tensor in values.items():
+        if tensor is None:
+            continue
+        lines.append(_format_tensor_stats(name, tensor))
+    if extra_lines:
+        lines.extend(extra_lines)
+    for line in lines:
+        _emit_debug_message(out_dir, accelerator, line)
 
 
 def run_eval(model: torch.nn.Module, loader: DataLoader, accelerator: Accelerator) -> Dict[str, float]:
@@ -281,6 +469,12 @@ def main() -> None:
             init_kwargs={"wandb": {"name": wandb_name}},
         )
 
+    debug_numeric_checks = bool(train_cfg.get("debug_numeric_checks", True))
+    max_grad_norm = float(train_cfg.get("max_grad_norm", 1.0))
+    numeric_hook_handles = []
+    if debug_numeric_checks:
+        numeric_hook_handles = _register_numeric_forward_hooks(accelerator.unwrap_model(model))
+
     for epoch in range(start_epoch, int(train_cfg["epochs"])):
         model.train()
         last_eval_step = -1
@@ -294,25 +488,178 @@ def main() -> None:
             mininterval=0.1,
         )
         for batch in train_loader:
+            image = None
+            label = None
+            gt_mask = None
+            out = None
+            heat_target = None
+            l_det = None
+            l_heat = None
+            l_mask = None
+            loss = None
+            grad_norm = None
             with accelerator.accumulate(model):
-                image = batch["image"]
-                pixel_values = batch["pixel_values"]
-                image_grid_thw = batch["image_grid_thw"]
-                label = batch["label"]
-                gt_mask = batch["mask"]
-                out = model(pixel_values, image_grid_thw, out_hw=gt_mask.shape[-2:])
-                heat_target = F.interpolate(gt_mask, size=out["heatmap"].shape[-2:], mode="nearest")
-                l_det = detection_bce_loss(out["p_edit"], label)
-                l_heat = focal_heatmap_loss(out["heatmap"], heat_target)
-                l_mask = bce_dice_loss(out["mask0"], gt_mask)
-                loss = (
-                    float(train_cfg["lambda_det"]) * l_det
-                    + float(train_cfg["lambda_heat"]) * l_heat
-                    + float(train_cfg["lambda_mask"]) * l_mask
-                )
-                accelerator.backward(loss)
-                opt.step()
-                opt.zero_grad(set_to_none=True)
+                try:
+                    image = batch["image"]
+                    pixel_values = batch["pixel_values"]
+                    image_grid_thw = batch["image_grid_thw"]
+                    label = batch["label"]
+                    gt_mask = batch["mask"]
+                    out = model(pixel_values, image_grid_thw, out_hw=gt_mask.shape[-2:])
+                    heat_target = F.interpolate(gt_mask, size=out["heatmap"].shape[-2:], mode="nearest")
+
+                    if debug_numeric_checks:
+                        _ensure_probability_tensor(
+                            name="label",
+                            tensor=label,
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+                        _ensure_probability_tensor(
+                            name="gt_mask",
+                            tensor=gt_mask,
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+                        _ensure_probability_tensor(
+                            name="heat_target",
+                            tensor=heat_target,
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+                        _ensure_probability_tensor(
+                            name="out.p_edit",
+                            tensor=out["p_edit"],
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+                        _ensure_probability_tensor(
+                            name="out.heatmap",
+                            tensor=out["heatmap"],
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+                        _ensure_probability_tensor(
+                            name="out.mask0",
+                            tensor=out["mask0"],
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+
+                    l_det = detection_bce_loss(out["p_edit"], label)
+                    l_heat = focal_heatmap_loss(out["heatmap"], heat_target)
+                    l_mask = bce_dice_loss(out["mask0"], gt_mask)
+                    loss = (
+                        float(train_cfg["lambda_det"]) * l_det
+                        + float(train_cfg["lambda_heat"]) * l_heat
+                        + float(train_cfg["lambda_mask"]) * l_mask
+                    )
+
+                    if debug_numeric_checks:
+                        _ensure_finite(
+                            name="loss/det",
+                            tensor=l_det,
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+                        _ensure_finite(
+                            name="loss/heat",
+                            tensor=l_heat,
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+                        _ensure_finite(
+                            name="loss/mask",
+                            tensor=l_mask,
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+                        _ensure_finite(
+                            name="loss/total",
+                            tensor=loss,
+                            accelerator=accelerator,
+                            epoch=epoch,
+                            step=step,
+                            out_dir=out_dir,
+                        )
+
+                    accelerator.backward(loss)
+
+                    if accelerator.sync_gradients and max_grad_norm > 0:
+                        grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        grad_norm_tensor = torch.as_tensor(grad_norm, device=accelerator.device).float()
+                        if debug_numeric_checks and not torch.isfinite(grad_norm_tensor).all():
+                            raise FloatingPointError(
+                                f"Non-finite grad norm detected at epoch={epoch} step={step}: {float(grad_norm_tensor.item())}"
+                            )
+
+                    if debug_numeric_checks and accelerator.sync_gradients:
+                        bad_grads = _collect_nonfinite_gradients(accelerator.unwrap_model(model))
+                        if bad_grads:
+                            raise FloatingPointError(
+                                "Non-finite gradients detected after backward: " + " | ".join(bad_grads)
+                            )
+
+                    opt.step()
+
+                    if debug_numeric_checks:
+                        bad_params = _collect_nonfinite_trainable_params(accelerator.unwrap_model(model))
+                        if bad_params:
+                            raise FloatingPointError(
+                                "Non-finite trainable parameters detected after optimizer step: "
+                                + " | ".join(bad_params)
+                            )
+
+                    opt.zero_grad(set_to_none=True)
+                except Exception as exc:
+                    extra_lines = []
+                    if grad_norm is not None:
+                        extra_lines.append(f"grad_norm={float(torch.as_tensor(grad_norm).float().item())}")
+                    if debug_numeric_checks:
+                        bad_grads = _collect_nonfinite_gradients(accelerator.unwrap_model(model))
+                        if bad_grads:
+                            extra_lines.append("bad_grads=" + " | ".join(bad_grads))
+                        bad_params = _collect_nonfinite_trainable_params(accelerator.unwrap_model(model))
+                        if bad_params:
+                            extra_lines.append("bad_params=" + " | ".join(bad_params))
+                    _emit_step_debug_snapshot(
+                        accelerator=accelerator,
+                        out_dir=out_dir,
+                        epoch=epoch,
+                        step=step,
+                        values={
+                            "label": label,
+                            "gt_mask": gt_mask,
+                            "heat_target": heat_target,
+                            "out.p_edit": None if out is None else out.get("p_edit"),
+                            "out.heatmap": None if out is None else out.get("heatmap"),
+                            "out.mask0": None if out is None else out.get("mask0"),
+                            "loss/det": l_det,
+                            "loss/heat": l_heat,
+                            "loss/mask": l_mask,
+                            "loss/total": loss,
+                        },
+                        extra_lines=extra_lines + [f"exception={type(exc).__name__}: {exc}"],
+                    )
+                    raise
 
             step += 1
 
@@ -412,6 +759,8 @@ def main() -> None:
 
     if use_wandb:
         accelerator.end_training()
+    for handle in numeric_hook_handles:
+        handle.remove()
 
 
 if __name__ == "__main__":

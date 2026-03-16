@@ -40,6 +40,8 @@ train:
   val_every_epoch: 1
   mixed_precision: bf16
   gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  debug_numeric_checks: true
   find_unused_parameters: true
   use_wandb: true
   wandb_project: aigc_stage1_magicbrush
