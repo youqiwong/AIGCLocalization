@@ -38,7 +38,7 @@ model:
     edge_head: true
 
 train:
-  epochs: 50
+  epochs: 300
   lr: 0.0001
   warmup_ratio: 0.05
   lr_scheduler: cosine
@@ -62,4 +62,4 @@ train:
   lambda_det: 1.0
   lambda_heat: 1.0
   lambda_mask: 2.0
-  lambda_edge: 0.1
+  lambda_edge: 0.2
