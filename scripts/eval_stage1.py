@@ -422,7 +422,21 @@ def main() -> None:
         vis_path=vis_path,
         max_vis_items=args.max_vis_items,
     )
-    print(json.dumps({args.split: result}, indent=2, ensure_ascii=False))
+    summary_csv = Path(args.summary_csv) if args.summary_csv else run_dir / f"magicbrush_{args.split}_summary.csv"
+    breakdown_csv = Path(args.breakdown_csv) if args.breakdown_csv else run_dir / f"magicbrush_{args.split}_class_breakdown.csv"
+    write_summary_csv([result], summary_csv)
+    write_breakdown_csv([result], breakdown_csv)
+    print(
+        json.dumps(
+            {
+                args.split: result,
+                "summary_csv": str(summary_csv),
+                "breakdown_csv": str(breakdown_csv),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
