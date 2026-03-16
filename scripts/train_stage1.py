@@ -368,10 +368,17 @@ def run_eval(
     label = torch.cat(all_label, dim=0)
     pred_mask = torch.cat(all_pred_mask, dim=0)
     gt_mask = torch.cat(all_gt_mask, dim=0)
+    forged = label >= 0.5
+    pixel_all = pixel_metrics(pred_mask, gt_mask)
+    pixel_forged = pixel_metrics(pred_mask[forged], gt_mask[forged]) if forged.any() else {"f1": 0.0, "iou": 0.0}
     m = {}
     m.update(binary_auc_ap(prob, label))
     m.update(cls_metrics(prob, label))
-    m.update(pixel_metrics(pred_mask, gt_mask))
+    m["f1_all"] = pixel_all["f1"]
+    m["iou_all"] = pixel_all["iou"]
+    m["f1"] = pixel_forged["f1"]
+    m["iou"] = pixel_forged["iou"]
+    m["num_forged"] = float(forged.sum().item())
     if total_items > 0:
         m.update({name: loss_sums[name] / float(total_items) for name in loss_sums})
     return m

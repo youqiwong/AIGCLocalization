@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import csv
 import json
 import sys
@@ -154,11 +155,12 @@ def evaluate_loader(
     pred_mask = torch.cat(pred_masks, dim=0)
     gt_mask = torch.cat(gt_masks, dim=0)
 
-    cls = cls_metrics(prob, label)
-    auc_ap = binary_auc_ap(prob, label)
     forged = label >= 0.5
     real = ~forged
-    pixel = pixel_metrics(pred_mask[forged], gt_mask[forged]) if forged.any() else {"f1": 0.0, "iou": 0.0}
+    cls = cls_metrics(prob, label)
+    auc_ap = binary_auc_ap(prob, label)
+    pixel_all = pixel_metrics(pred_mask, gt_mask)
+    pixel_forged = pixel_metrics(pred_mask[forged], gt_mask[forged]) if forged.any() else {"f1": 0.0, "iou": 0.0}
     pred_cls = (prob >= 0.5).float()
     real_acc = float((pred_cls[real] == label[real]).float().mean().item()) if real.any() else 0.0
     forged_acc = float((pred_cls[forged] == label[forged]).float().mean().item()) if forged.any() else 0.0
@@ -171,8 +173,10 @@ def evaluate_loader(
         "image_acc": cls["acc"],
         "image_precision": cls["precision"],
         "image_recall": cls["recall"],
-        "pixel_f1": pixel["f1"],
-        "pixel_iou": pixel["iou"],
+        "pixel_f1": pixel_forged["f1"],
+        "pixel_iou": pixel_forged["iou"],
+        "pixel_f1_all": pixel_all["f1"],
+        "pixel_iou_all": pixel_all["iou"],
         "num_samples": int(label.numel()),
         "num_real": int(real.sum().item()),
         "num_forged": int(forged.sum().item()),
@@ -241,6 +245,22 @@ def build_magicbrush_dataset(cfg: Dict[str, Any], split: str):
     )
 
 
+def _merge_eval_cfg(cli_cfg: Dict[str, Any], ckpt_cfg: Dict[str, Any], run_dir: Path) -> Dict[str, Any]:
+    cfg = copy.deepcopy(ckpt_cfg if ckpt_cfg else cli_cfg)
+    if "data" not in cfg:
+        cfg["data"] = {}
+    if "model" not in cfg:
+        cfg["model"] = {}
+    if "train" not in cfg:
+        cfg["train"] = {}
+    if cli_cfg:
+        cfg["output_dir"] = cli_cfg.get("output_dir", cfg.get("output_dir", str(run_dir)))
+        if "data" in cli_cfg and "manifests" in cli_cfg["data"]:
+            cfg["data"]["manifests"] = cli_cfg["data"]["manifests"]
+    cfg["output_dir"] = str(run_dir)
+    return cfg
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
@@ -275,23 +295,37 @@ def main() -> None:
     parser.add_argument("--breakdown-csv", type=str, default="")
     args = parser.parse_args()
 
-    cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
     requested_num_gpus = max(1, int(args.num_gpus))
     available_num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     if requested_num_gpus > 1 and available_num_gpus < requested_num_gpus:
         raise ValueError(f"requested {requested_num_gpus} GPUs, but only {available_num_gpus} are available")
     device = torch.device("cuda:0" if available_num_gpus > 0 else "cpu")
-    eval_batch_size = int(args.batch_size) if int(args.batch_size) > 0 else int(cfg["data"]["batch_size"])
-    run_dir = Path(args.checkpoint).resolve().parent if args.checkpoint else resolve_eval_output_dir(cfg["output_dir"])
-    cfg["output_dir"] = str(run_dir)
+    cli_cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
+    run_dir = Path(args.checkpoint).resolve().parent if args.checkpoint else resolve_eval_output_dir(cli_cfg["output_dir"])
     default_ckpt = run_dir / "best_by_iou.pt"
     if not default_ckpt.exists():
         default_ckpt = run_dir / "best_by_iou_full.pt"
     ckpt_path = args.checkpoint or str(default_ckpt)
+    ckpt = load_checkpoint(ckpt_path, map_location="cpu")
+    cfg = _merge_eval_cfg(cli_cfg, ckpt.get("cfg") if isinstance(ckpt.get("cfg"), dict) else {}, run_dir)
+    eval_batch_size = int(args.batch_size) if int(args.batch_size) > 0 else int(cfg["data"]["batch_size"])
 
     base_model = Stage1ForgeryModel(cfg["model"]).to(device)
-    ckpt = load_checkpoint(ckpt_path, map_location="cpu")
-    load_stage1_checkpoint_into_model(base_model, ckpt)
+    load_info = load_stage1_checkpoint_into_model(base_model, ckpt)
+    print(
+        json.dumps(
+            {
+                "checkpoint": ckpt_path,
+                "using_checkpoint_cfg": bool(ckpt.get("cfg")),
+                "load_missing_keys": load_info["missing"][:50],
+                "load_unexpected_keys": load_info["unexpected"][:50],
+                "num_missing_keys": len(load_info["missing"]),
+                "num_unexpected_keys": len(load_info["unexpected"]),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     model = EvalStage1Wrapper(base_model).to(device)
     if available_num_gpus > 1 and requested_num_gpus > 1:
         model = nn.DataParallel(model, device_ids=list(range(requested_num_gpus)))

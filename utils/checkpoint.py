@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -79,15 +79,24 @@ def build_slim_checkpoint_payload(
     return payload
 
 
-def load_stage1_checkpoint_into_model(model, checkpoint: Dict[str, Any]) -> None:
+def load_stage1_checkpoint_into_model(model, checkpoint: Dict[str, Any]) -> Dict[str, List[str]]:
+    info: Dict[str, List[str]] = {"missing": [], "unexpected": []}
     fmt = checkpoint.get("format", "")
     if fmt == "stage1_full_v1" or "model" in checkpoint:
-        model.load_state_dict(checkpoint["model"], strict=False)
-        return
+        missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
+        info["missing"].extend(list(missing))
+        info["unexpected"].extend(list(unexpected))
+        return info
     if fmt not in {"stage1_slim_v1", "stage1_resume_v2"}:
         raise ValueError(f"unsupported checkpoint format: {fmt or 'unknown'}")
-    model.adapter.load_state_dict(checkpoint["adapter"], strict=False)
-    model.proposer.load_state_dict(checkpoint["proposer"], strict=False)
-    model.decoder.load_state_dict(checkpoint["decoder"], strict=False)
+    for module_name, module, state in [
+        ("adapter", model.adapter, checkpoint["adapter"]),
+        ("proposer", model.proposer, checkpoint["proposer"]),
+        ("decoder", model.decoder, checkpoint["decoder"]),
+    ]:
+        missing, unexpected = module.load_state_dict(state, strict=False)
+        info["missing"].extend([f"{module_name}.{name}" for name in missing])
+        info["unexpected"].extend([f"{module_name}.{name}" for name in unexpected])
     model.backbone.load_lora_state_dict(checkpoint.get("backbone_lora", {}))
     model.backbone.load_trainable_state_dict(checkpoint.get("backbone_trainable", {}))
+    return info
