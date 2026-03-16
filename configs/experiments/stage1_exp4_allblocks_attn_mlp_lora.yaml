@@ -39,7 +39,9 @@ model:
 
 train:
   epochs: 50
-  lr: 0.0001
+  lr: 5.0e-5
+  warmup_ratio: 0.05
+  lr_scheduler: cosine
   weight_decay: 0.01
   log_every: 10
   print_train_log: false

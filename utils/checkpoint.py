@@ -18,8 +18,10 @@ def build_full_checkpoint_payload(
     *,
     model,
     optimizer,
+    scheduler=None,
     epoch: int,
     step: int,
+    optimizer_step: Optional[int] = None,
     best_iou: float,
     best_step: int,
     cfg: Optional[Dict[str, Any]] = None,
@@ -28,15 +30,19 @@ def build_full_checkpoint_payload(
         model=model,
         epoch=epoch,
         step=step,
+        optimizer_step=optimizer_step,
         best_iou=best_iou,
         best_step=best_step,
         cfg=cfg,
     )
-    return {
+    payload = {
         "format": "stage1_resume_v2",
         **slim_payload,
         "optimizer": optimizer.state_dict(),
     }
+    if scheduler is not None:
+        payload["scheduler"] = scheduler.state_dict()
+    return payload
 
 
 def build_slim_checkpoint_payload(
@@ -44,6 +50,7 @@ def build_slim_checkpoint_payload(
     model,
     epoch: int,
     step: int,
+    optimizer_step: Optional[int] = None,
     best_iou: float,
     best_step: int,
     cfg: Optional[Dict[str, Any]] = None,
@@ -59,6 +66,8 @@ def build_slim_checkpoint_payload(
         "best_step": best_step,
         "cfg": cfg,
     }
+    if optimizer_step is not None:
+        payload["optimizer_step"] = optimizer_step
     lora_state = model.backbone.get_lora_state_dict()
     if lora_state:
         payload["backbone_lora"] = lora_state

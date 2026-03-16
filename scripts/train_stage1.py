@@ -2,6 +2,7 @@
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import random
 import sys
@@ -67,6 +68,39 @@ def build_loader(
         loader_kwargs["prefetch_factor"] = prefetch_factor
         loader_kwargs["persistent_workers"] = persistent_workers
     return DataLoader(**loader_kwargs)
+
+
+def _lr_scale_for_step(
+    optimizer_step: int,
+    *,
+    scheduler_name: str,
+    num_training_steps: int,
+    num_warmup_steps: int,
+) -> float:
+    if num_training_steps <= 0:
+        return 1.0
+    scheduler_name = scheduler_name.lower()
+    if scheduler_name not in {"cosine", "constant", "none"}:
+        raise ValueError(f"unsupported lr scheduler: {scheduler_name}")
+
+    step_index = max(0, min(optimizer_step, num_training_steps - 1))
+    if num_warmup_steps > 0 and step_index < num_warmup_steps:
+        return float(step_index + 1) / float(max(1, num_warmup_steps))
+    if scheduler_name == "cosine":
+        decay_steps = max(1, num_training_steps - num_warmup_steps)
+        progress = float(step_index - num_warmup_steps + 1) / float(decay_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return 1.0
+
+
+def _set_optimizer_lrs(optimizer: torch.optim.Optimizer, base_lrs: List[float], scale: float) -> None:
+    for group, base_lr in zip(optimizer.param_groups, base_lrs):
+        group["lr"] = float(base_lr) * float(scale)
+
+
+def _get_current_lr(optimizer: torch.optim.Optimizer) -> float:
+    return float(optimizer.param_groups[0]["lr"])
 
 
 def _iter_named_tensors(obj: Any, prefix: str) -> Iterable[Tuple[str, torch.Tensor]]:
@@ -294,6 +328,7 @@ def run_validation(
     *,
     epoch: int,
     step: int,
+    optimizer_step: int,
     model: torch.nn.Module,
     opt: torch.optim.Optimizer,
     val_loader: DataLoader,
@@ -318,6 +353,7 @@ def run_validation(
             accelerator=accelerator,
             model=model,
             opt=opt,
+            optimizer_step=optimizer_step,
             epoch=epoch,
             step=step,
             best_iou=best_iou,
@@ -335,6 +371,7 @@ def save_stage1_checkpoints(
     accelerator: Accelerator,
     model: torch.nn.Module,
     opt: torch.optim.Optimizer,
+    optimizer_step: int,
     epoch: int,
     step: int,
     best_iou: float,
@@ -350,6 +387,7 @@ def save_stage1_checkpoints(
             model=unwrapped,
             epoch=epoch,
             step=step,
+            optimizer_step=optimizer_step,
             best_iou=best_iou,
             best_step=best_step,
             cfg=cfg,
@@ -360,6 +398,7 @@ def save_stage1_checkpoints(
         build_full_checkpoint_payload(
             model=unwrapped,
             optimizer=opt,
+            optimizer_step=optimizer_step,
             epoch=epoch,
             step=step,
             best_iou=best_iou,
@@ -442,8 +481,17 @@ def main() -> None:
     )
     model, opt, train_loader, val_loader = accelerator.prepare(model, opt, train_loader, val_loader)
 
+    grad_accum_steps = int(train_cfg.get("gradient_accumulation_steps", 1))
+    num_update_steps_per_epoch = max(1, math.ceil(len(train_loader) / grad_accum_steps))
+    total_optimizer_steps = int(train_cfg["epochs"]) * num_update_steps_per_epoch
+    warmup_ratio = float(train_cfg.get("warmup_ratio", 0.0))
+    num_warmup_steps = int(math.ceil(total_optimizer_steps * warmup_ratio))
+    scheduler_name = str(train_cfg.get("lr_scheduler", "constant")).lower()
+    base_lrs = [float(train_cfg["lr"]) for _ in opt.param_groups]
+
     start_epoch = 0
     step = 0
+    optimizer_step = 0
     best_iou = -1.0
     best_step = -1
     val_every_steps = int(train_cfg.get("val_every_steps", 0))
@@ -457,8 +505,22 @@ def main() -> None:
         opt.load_state_dict(ckpt["optimizer"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         step = int(ckpt.get("step", 0))
+        optimizer_step = int(ckpt.get("optimizer_step", step // max(1, grad_accum_steps)))
         best_iou = float(ckpt.get("best_iou", -1.0))
         best_step = int(ckpt.get("best_step", -1))
+
+    current_lr_scale = _lr_scale_for_step(
+        optimizer_step=optimizer_step,
+        scheduler_name=scheduler_name,
+        num_training_steps=total_optimizer_steps,
+        num_warmup_steps=num_warmup_steps,
+    )
+    _set_optimizer_lrs(opt, base_lrs, current_lr_scale)
+    accelerator.print(
+        f"[Scheduler] type={scheduler_name} warmup_ratio={warmup_ratio} warmup_steps={num_warmup_steps} "
+        f"total_optimizer_steps={total_optimizer_steps} grad_accumulation_steps={grad_accum_steps} "
+        f"start_lr={_get_current_lr(opt):.6g}"
+    )
 
     if use_wandb:
         wandb_project = os.environ.get("WANDB_PROJECT") or train_cfg.get("wandb_project") or "aigc_stage1_stage1"
@@ -498,6 +560,7 @@ def main() -> None:
             l_mask = None
             loss = None
             grad_norm = None
+            applied_lr = _get_current_lr(opt)
             with accelerator.accumulate(model):
                 try:
                     image = batch["image"]
@@ -603,32 +666,49 @@ def main() -> None:
 
                     accelerator.backward(loss)
 
-                    if accelerator.sync_gradients and max_grad_norm > 0:
-                        grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
-                        grad_norm_tensor = torch.as_tensor(grad_norm, device=accelerator.device).float()
-                        if debug_numeric_checks and not torch.isfinite(grad_norm_tensor).all():
-                            raise FloatingPointError(
-                                f"Non-finite grad norm detected at epoch={epoch} step={step}: {float(grad_norm_tensor.item())}"
-                            )
+                    if accelerator.sync_gradients:
+                        if max_grad_norm > 0:
+                            grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                            grad_norm_tensor = torch.as_tensor(grad_norm, device=accelerator.device).float()
+                            if debug_numeric_checks and not torch.isfinite(grad_norm_tensor).all():
+                                raise FloatingPointError(
+                                    f"Non-finite grad norm detected at epoch={epoch} step={step}: {float(grad_norm_tensor.item())}"
+                                )
 
-                    if debug_numeric_checks and accelerator.sync_gradients:
-                        bad_grads = _collect_nonfinite_gradients(accelerator.unwrap_model(model))
-                        if bad_grads:
-                            raise FloatingPointError(
-                                "Non-finite gradients detected after backward: " + " | ".join(bad_grads)
-                            )
+                        if debug_numeric_checks:
+                            bad_grads = _collect_nonfinite_gradients(accelerator.unwrap_model(model))
+                            if bad_grads:
+                                raise FloatingPointError(
+                                    "Non-finite gradients detected after backward: " + " | ".join(bad_grads)
+                                )
 
-                    opt.step()
+                        lr_scale = _lr_scale_for_step(
+                            optimizer_step=optimizer_step,
+                            scheduler_name=scheduler_name,
+                            num_training_steps=total_optimizer_steps,
+                            num_warmup_steps=num_warmup_steps,
+                        )
+                        _set_optimizer_lrs(opt, base_lrs, lr_scale)
+                        applied_lr = _get_current_lr(opt)
+                        opt.step()
+                        optimizer_step += 1
 
-                    if debug_numeric_checks:
-                        bad_params = _collect_nonfinite_trainable_params(accelerator.unwrap_model(model))
-                        if bad_params:
-                            raise FloatingPointError(
-                                "Non-finite trainable parameters detected after optimizer step: "
-                                + " | ".join(bad_params)
-                            )
+                        if debug_numeric_checks:
+                            bad_params = _collect_nonfinite_trainable_params(accelerator.unwrap_model(model))
+                            if bad_params:
+                                raise FloatingPointError(
+                                    "Non-finite trainable parameters detected after optimizer step: "
+                                    + " | ".join(bad_params)
+                                )
 
-                    opt.zero_grad(set_to_none=True)
+                        next_lr_scale = _lr_scale_for_step(
+                            optimizer_step=optimizer_step,
+                            scheduler_name=scheduler_name,
+                            num_training_steps=total_optimizer_steps,
+                            num_warmup_steps=num_warmup_steps,
+                        )
+                        _set_optimizer_lrs(opt, base_lrs, next_lr_scale)
+                        opt.zero_grad(set_to_none=True)
                 except Exception as exc:
                     extra_lines = []
                     if grad_norm is not None:
@@ -662,6 +742,7 @@ def main() -> None:
                     raise
 
             step += 1
+            current_lr = applied_lr
 
             if accelerator.is_local_main_process:
                 pbar.update(1)
@@ -670,6 +751,7 @@ def main() -> None:
                     det=f"{float(l_det.item()):.4f}",
                     heat=f"{float(l_heat.item()):.4f}",
                     mask=f"{float(l_mask.item()):.4f}",
+                    lr=f"{current_lr:.2e}",
                     step=step,
                     refresh=True,
                 )
@@ -695,6 +777,7 @@ def main() -> None:
                             "train/l_det": float(l_det.item()),
                             "train/l_heat": float(l_heat.item()),
                             "train/l_mask": float(l_mask.item()),
+                            "train/lr": current_lr,
                             "epoch": epoch,
                         },
                         step=step,
@@ -715,6 +798,7 @@ def main() -> None:
                 best_iou, best_step = run_validation(
                     epoch=epoch,
                     step=step,
+                    optimizer_step=optimizer_step,
                     model=model,
                     opt=opt,
                     val_loader=val_loader,
@@ -733,6 +817,7 @@ def main() -> None:
             best_iou, best_step = run_validation(
                 epoch=epoch,
                 step=step,
+                optimizer_step=optimizer_step,
                 model=model,
                 opt=opt,
                 val_loader=val_loader,
@@ -750,6 +835,7 @@ def main() -> None:
             accelerator=accelerator,
             model=model,
             opt=opt,
+            optimizer_step=optimizer_step,
             epoch=epoch,
             step=step,
             best_iou=best_iou,
