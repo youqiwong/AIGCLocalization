@@ -16,7 +16,7 @@ from losses import bce_dice_loss, detection_bce_loss, edge_bce_loss, focal_heatm
 from models.stage1_model import Stage1ForgeryModel
 from utils.checkpoint import load_checkpoint, load_stage1_checkpoint_into_model
 from utils.metrics import binary_auc_ap, cls_metrics, pixel_metrics
-from utils.vis import save_triplet_vis
+from utils.vis import save_eval_annotated_vis
 
 
 def resolve_eval_output_dir(base_output_dir: str) -> Path:
@@ -37,16 +37,19 @@ def main() -> None:
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, default="")
     parser.add_argument("--split", type=str, choices=["val", "test"], default="test")
+    parser.add_argument("--vis-path", type=str, default="")
+    parser.add_argument("--max-vis-items", type=int, default=5)
     args = parser.parse_args()
 
     cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
     device = torch.device(cfg.get("device", "cuda") if torch.cuda.is_available() else "cpu")
-    run_dir = resolve_eval_output_dir(cfg["output_dir"])
+    run_dir = Path(args.checkpoint).resolve().parent if args.checkpoint else resolve_eval_output_dir(cfg["output_dir"])
     cfg["output_dir"] = str(run_dir)
     default_ckpt = run_dir / "best_by_iou.pt"
     if not default_ckpt.exists():
         default_ckpt = run_dir / "best_by_iou_full.pt"
     ckpt_path = args.checkpoint or str(default_ckpt)
+    vis_path = args.vis_path or str(run_dir / f"{args.split}_vis_annotated.png")
 
     ds = MagicBrushDataset(
         manifest_path=cfg["data"]["manifests"][args.split],
@@ -112,14 +115,15 @@ def main() -> None:
             loss_sums["l_mask"] += float(l_mask.item()) * batch_items
             loss_sums["l_edge"] += float(l_edge.item()) * batch_items
             if not vis_saved:
-                save_triplet_vis(
+                save_eval_annotated_vis(
                     image.cpu(),
                     gt_mask=mask.cpu(),
                     heatmap=out["heatmap"].cpu(),
                     pred_mask=out["mask0"].cpu(),
-                    gt_edge=edge_gt.cpu(),
-                    pred_edge=(torch.sigmoid(out["edge0"]).cpu() if "edge0" in out else None),
-                    path=str(Path(cfg["output_dir"]) / f"{args.split}_vis.png"),
+                    prob=out["p_edit"].cpu(),
+                    label=label.cpu(),
+                    path=vis_path,
+                    max_items=args.max_vis_items,
                 )
                 vis_saved = True
 
