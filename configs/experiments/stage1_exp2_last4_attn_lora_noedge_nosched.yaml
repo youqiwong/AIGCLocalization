@@ -1,0 +1,65 @@
+seed: 42
+output_dir: /home/tione/notebook/users/youqiwang/AIGCLocalization/outputs/exp2_last4_attn_lora_noedge_nosched
+device: cuda
+
+data:
+  data_root: /home/tione/notebook/datasets/MagicBrush/data
+  manifests:
+    train: artifacts/manifests/debug_train.jsonl
+    val: artifacts/manifests/debug_val.jsonl
+    test: artifacts/manifests/debug_test.jsonl
+  image_size: 512
+  num_workers: 8
+  batch_size: 16
+  prefetch_factor: 1
+  persistent_workers: false
+
+model:
+  backbone:
+    name_or_path: /home/tione/notebook/models/modelscope/hub/models/Qwen/Qwen3-VL-8B-Instruct
+    mode: qwen3vl
+    trainable_vision_blocks: 0
+    use_lora: true
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_last_n_blocks: 4
+    lora_target_regex: ""
+    lora_all_blocks: false
+    lora_include_mlp: false
+    allow_fallback_mock: false
+  adapter:
+    type: suspicion_gated
+    out_channels: 256
+  proposer:
+    topk_regions: 8
+    region_window: 48
+  decoder:
+    edge_head: false
+
+train:
+  epochs: 300
+  lr: 0.0001
+  warmup_ratio: 0.0
+  lr_scheduler: none
+  weight_decay: 0.01
+  log_every: 10
+  print_train_log: false
+  vis_every: 50
+  val_every_epoch: 1
+  mixed_precision: bf16
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  debug_numeric_checks: true
+  find_unused_parameters: true
+  use_wandb: true
+  wandb_project: aigc_stage1_magicbrush
+  wandb_name: exp2_last4_attn_lora_noedge_nosched
+  resume: ""
+  init_from_checkpoint: ""
+  use_edge_loss: false
+  edge_kernel_size: 5
+  lambda_det: 1.0
+  lambda_heat: 1.0
+  lambda_mask: 2.0
+  lambda_edge: 0.0

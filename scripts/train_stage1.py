@@ -293,6 +293,19 @@ def _emit_step_debug_snapshot(
         _emit_debug_message(out_dir, accelerator, line)
 
 
+def _forged_only_loss(
+    loss_fn,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    label: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    forged = label >= 0.5
+    forged_count = forged.sum().to(device=label.device, dtype=torch.float32)
+    if not bool(forged.any().item()):
+        return pred.float().sum() * 0.0, forged_count
+    return loss_fn(pred[forged], target[forged]), forged_count
+
+
 def run_eval(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -303,8 +316,9 @@ def run_eval(
     model.eval()
     all_prob, all_label, all_pred_mask, all_gt_mask = [], [], [], []
     use_edge_loss = bool(train_cfg.get("use_edge_loss", True))
-    loss_sums = {"loss": 0.0, "l_det": 0.0, "l_heat": 0.0, "l_mask": 0.0, "l_edge": 0.0}
+    loss_sums = {"l_det": 0.0, "l_heat": 0.0, "l_mask": 0.0, "l_edge": 0.0}
     total_items = 0
+    total_forged_items = 0
     vis_saved = False
     with torch.no_grad():
         vbar = tqdm(loader, desc="Val", leave=False, disable=not accelerator.is_local_main_process, dynamic_ncols=True, mininterval=0.0)
@@ -319,10 +333,10 @@ def run_eval(
             heat_target = F.interpolate(mask, size=out["heatmap"].shape[-2:], mode="nearest")
 
             l_det = detection_bce_loss(out["p_edit"], label)
-            l_heat = focal_heatmap_loss(out["heatmap"], heat_target)
-            l_mask = bce_dice_loss(out["mask0"], mask)
+            l_heat, batch_forged_items = _forged_only_loss(focal_heatmap_loss, out["heatmap"], heat_target, label)
+            l_mask, _ = _forged_only_loss(bce_dice_loss, out["mask0"], mask, label)
             if use_edge_loss and "edge0" in out:
-                l_edge = edge_bce_loss(out["edge0"], edge_gt)
+                l_edge, _ = _forged_only_loss(edge_bce_loss, out["edge0"], edge_gt, label)
             else:
                 l_edge = torch.zeros_like(l_det)
             loss = (
@@ -337,21 +351,23 @@ def run_eval(
             pred = accelerator.gather_for_metrics(out["mask0"].detach())
             gt = accelerator.gather_for_metrics(mask.detach())
             batch_items = torch.tensor([label.shape[0]], device=label.device, dtype=torch.float32)
+            batch_forged_items = batch_forged_items.view(1)
             gathered_items = accelerator.gather_for_metrics(batch_items)
+            gathered_forged_items = accelerator.gather_for_metrics(batch_forged_items)
             all_prob.append(prob.cpu())
             all_label.append(lab.cpu())
             all_pred_mask.append(pred.cpu())
             all_gt_mask.append(gt.cpu())
             total_items += int(gathered_items.sum().item())
-            for name, tensor in {
-                "loss": loss,
-                "l_det": l_det,
-                "l_heat": l_heat,
-                "l_mask": l_mask,
-                "l_edge": l_edge,
-            }.items():
-                gathered = accelerator.gather_for_metrics((tensor.detach() * batch_items).view(1))
-                loss_sums[name] += float(gathered.sum().item())
+            total_forged_items += int(gathered_forged_items.sum().item())
+            gathered_det = accelerator.gather_for_metrics((l_det.detach() * batch_items).view(1))
+            gathered_heat = accelerator.gather_for_metrics((l_heat.detach() * batch_forged_items).view(1))
+            gathered_mask = accelerator.gather_for_metrics((l_mask.detach() * batch_forged_items).view(1))
+            gathered_edge = accelerator.gather_for_metrics((l_edge.detach() * batch_forged_items).view(1))
+            loss_sums["l_det"] += float(gathered_det.sum().item())
+            loss_sums["l_heat"] += float(gathered_heat.sum().item())
+            loss_sums["l_mask"] += float(gathered_mask.sum().item())
+            loss_sums["l_edge"] += float(gathered_edge.sum().item())
             if vis_path and not vis_saved and accelerator.is_main_process:
                 save_triplet_vis(
                     image=image.detach().float().cpu(),
@@ -380,7 +396,23 @@ def run_eval(
     m["iou"] = pixel_forged["iou"]
     m["num_forged"] = float(forged.sum().item())
     if total_items > 0:
-        m.update({name: loss_sums[name] / float(total_items) for name in loss_sums})
+        m["l_det"] = loss_sums["l_det"] / float(total_items)
+    else:
+        m["l_det"] = 0.0
+    if total_forged_items > 0:
+        m["l_heat"] = loss_sums["l_heat"] / float(total_forged_items)
+        m["l_mask"] = loss_sums["l_mask"] / float(total_forged_items)
+        m["l_edge"] = loss_sums["l_edge"] / float(total_forged_items)
+    else:
+        m["l_heat"] = 0.0
+        m["l_mask"] = 0.0
+        m["l_edge"] = 0.0
+    m["loss"] = (
+        float(train_cfg["lambda_det"]) * m["l_det"]
+        + float(train_cfg["lambda_heat"]) * m["l_heat"]
+        + float(train_cfg["lambda_mask"]) * m["l_mask"]
+        + float(train_cfg.get("lambda_edge", 0.1)) * m["l_edge"]
+    )
     return m
 
 
@@ -726,10 +758,10 @@ def main() -> None:
                             )
 
                     l_det = detection_bce_loss(out["p_edit"], label)
-                    l_heat = focal_heatmap_loss(out["heatmap"], heat_target)
-                    l_mask = bce_dice_loss(out["mask0"], gt_mask)
+                    l_heat, _ = _forged_only_loss(focal_heatmap_loss, out["heatmap"], heat_target, label)
+                    l_mask, _ = _forged_only_loss(bce_dice_loss, out["mask0"], gt_mask, label)
                     if use_edge_loss and "edge0" in out:
-                        l_edge = edge_bce_loss(out["edge0"], edge_gt)
+                        l_edge, _ = _forged_only_loss(edge_bce_loss, out["edge0"], edge_gt, label)
                     else:
                         l_edge = torch.zeros_like(l_det)
                     loss = (

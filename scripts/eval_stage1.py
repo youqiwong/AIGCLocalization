@@ -41,6 +41,14 @@ class EvalStage1Wrapper(nn.Module):
         return result
 
 
+def _forged_only_loss(loss_fn, pred: torch.Tensor, target: torch.Tensor, label: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    forged = label >= 0.5
+    forged_count = int(forged.sum().item())
+    if forged_count == 0:
+        return pred.float().sum() * 0.0, 0
+    return loss_fn(pred[forged], target[forged]), forged_count
+
+
 def resolve_eval_output_dir(base_output_dir: str) -> Path:
     root = Path(base_output_dir)
     if not root.exists():
@@ -82,8 +90,9 @@ def evaluate_loader(
 ) -> Dict[str, Any]:
     model.eval()
     probs, labels, pred_masks, gt_masks = [], [], [], []
-    loss_sums = {"loss": 0.0, "l_det": 0.0, "l_heat": 0.0, "l_mask": 0.0, "l_edge": 0.0}
+    loss_sums = {"l_det": 0.0, "l_heat": 0.0, "l_mask": 0.0, "l_edge": 0.0}
     total_items = 0
+    total_forged_items = 0
     use_edge_loss = bool(cfg["train"].get("use_edge_loss", True))
     vis_saved = False
     print(
@@ -112,10 +121,10 @@ def evaluate_loader(
 
             heat_target = torch.nn.functional.interpolate(mask, size=out["heatmap"].shape[-2:], mode="nearest")
             l_det = detection_bce_loss(out["p_edit"], label)
-            l_heat = focal_heatmap_loss(out["heatmap"], heat_target)
-            l_mask = bce_dice_loss(out["mask0"], mask)
+            l_heat, batch_forged_items = _forged_only_loss(focal_heatmap_loss, out["heatmap"], heat_target, label)
+            l_mask, _ = _forged_only_loss(bce_dice_loss, out["mask0"], mask, label)
             if use_edge_loss and "edge0" in out:
-                l_edge = edge_bce_loss(out["edge0"], edge_gt)
+                l_edge, _ = _forged_only_loss(edge_bce_loss, out["edge0"], edge_gt, label)
             else:
                 l_edge = torch.zeros_like(l_det)
             loss = (
@@ -130,12 +139,12 @@ def evaluate_loader(
             pred_masks.append(out["mask0"].cpu())
             gt_masks.append(mask.cpu())
             batch_items = int(label.shape[0])
+            total_forged_items += int(batch_forged_items)
             total_items += batch_items
-            loss_sums["loss"] += float(loss.item()) * batch_items
             loss_sums["l_det"] += float(l_det.item()) * batch_items
-            loss_sums["l_heat"] += float(l_heat.item()) * batch_items
-            loss_sums["l_mask"] += float(l_mask.item()) * batch_items
-            loss_sums["l_edge"] += float(l_edge.item()) * batch_items
+            loss_sums["l_heat"] += float(l_heat.item()) * batch_forged_items
+            loss_sums["l_mask"] += float(l_mask.item()) * batch_forged_items
+            loss_sums["l_edge"] += float(l_edge.item()) * batch_forged_items
 
             if not vis_saved:
                 save_eval_annotated_vis(
@@ -183,8 +192,16 @@ def evaluate_loader(
         "real_acc": real_acc,
         "forged_acc": forged_acc,
     }
-    if total_items > 0:
-        result.update({name: loss_sums[name] / float(total_items) for name in loss_sums})
+    result["l_det"] = loss_sums["l_det"] / float(total_items) if total_items > 0 else 0.0
+    result["l_heat"] = loss_sums["l_heat"] / float(total_forged_items) if total_forged_items > 0 else 0.0
+    result["l_mask"] = loss_sums["l_mask"] / float(total_forged_items) if total_forged_items > 0 else 0.0
+    result["l_edge"] = loss_sums["l_edge"] / float(total_forged_items) if total_forged_items > 0 else 0.0
+    result["loss"] = (
+        float(cfg["train"]["lambda_det"]) * result["l_det"]
+        + float(cfg["train"]["lambda_heat"]) * result["l_heat"]
+        + float(cfg["train"]["lambda_mask"]) * result["l_mask"]
+        + float(cfg["train"].get("lambda_edge", 0.1)) * result["l_edge"]
+    )
     return result
 
 
